@@ -65,12 +65,16 @@ object PdfBlockExtractor {
      * v4: multi-word small figure fragments excluded (vector-figure axis
      * labels and scale-bar annotations were translated and painted over
      * the figure panels).
+     * v5: image-overlap threshold back to 0.5 — at 0.2 figure captions
+     * slightly overlapping a panel image were excluded and stayed
+     * untranslated.
      */
-    const val LAYOUT_SCHEMA_VERSION = 4
+    const val LAYOUT_SCHEMA_VERSION = 5
 
     /** A line counts as figure text when at least this share of it lies
-     *  inside a placed image. */
-    private const val IMAGE_OVERLAP_THRESHOLD = 0.20f
+     *  inside a placed image. 0.5: mostly inside the image. Lower values
+     *  swallowed caption lines that merely touch a panel image. */
+    private const val IMAGE_OVERLAP_THRESHOLD = 0.50f
 
     /** Fallback figure-label test: a line shorter (in height) than this
      *  share of the body size, narrower than [FIGURE_FRAGMENT_MAX_WIDTH]
