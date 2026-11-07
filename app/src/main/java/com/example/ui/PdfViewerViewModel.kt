@@ -562,7 +562,7 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun isTranslatableText(text: String): Boolean =
-        text.any { it.isLetter() } && text.trim().length >= 3
+        text.any { it.isLetter() } && text.trim().length >= 3 && !PdfBlockExtractor.isBylineBlock(text)
 
     private suspend fun translatePageInternal(pageIdx: Int) {
         if (!claimedTranslationPages.add(pageIdx)) return
@@ -598,6 +598,7 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                 val tgt = if (src == "ja") "en" else "ja"
                 val separator = if (tgt == "ja") "" else " "
                 val translated = StringBuilder()
+                var blockFailed = false
                 for (chunk in PdfBlockExtractor.splitIntoChunks(block.text)) {
                     when (val r = translateController.translateStream(chunk, src, tgt) {}) {
                         is TranslateController.TranslateResult.Ok -> {
@@ -606,12 +607,13 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                         }
                         is TranslateController.TranslateResult.Error -> {
                             android.util.Log.w("PdfViewerViewModel", "Block translation failed (page $pageIdx): ${r.message}")
+                            blockFailed = true
                             failed = true
                             break
                         }
                     }
                 }
-                if (failed) break
+                if (blockFailed) continue
                 val translatedText = translated.toString().trim()
                 if (translatedText.isNotEmpty()) {
                     results.add(TranslatedBlock(block, translatedText))

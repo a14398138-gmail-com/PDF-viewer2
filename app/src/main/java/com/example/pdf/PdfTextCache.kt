@@ -20,12 +20,10 @@ object PdfTextCache {
     private const val DIR_NAME = "text_cache"
 
     /**
-     * Version of the page-cache payload. v2 adds the placed-image
-     * rectangles the block extractor needs to keep figure text out of
-     * translations; older entries are treated as misses so pages are
-     * re-extracted once with the new data.
+     * Version of the page-cache payload. v3 adds horizontal gap splitting
+     * for multi-column layouts and natural word spacing reconstruction.
      */
-    private const val PAGE_SCHEMA_VERSION = 2
+    private const val PAGE_SCHEMA_VERSION = 3
 
     fun keyFor(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
@@ -74,7 +72,7 @@ object PdfTextCache {
                 .map { (lineIndex, lineWords) ->
                     TextLine(
                         lineIndex = lineIndex,
-                        text = lineWords.joinToString("") { it.text },
+                        text = PdfTextExtractor.joinWords(lineWords),
                         relX = lineWords.minOf { it.relX },
                         relY = lineWords.minOf { it.relY },
                         relWidth = lineWords.maxOf { it.relX + it.relWidth } - lineWords.minOf { it.relX },

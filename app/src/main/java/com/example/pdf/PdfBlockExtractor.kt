@@ -61,13 +61,13 @@ object PdfBlockExtractor {
      * by block index, which only has meaning within one schema, so any
      * change to how lines are grouped must bump this — [PdfTextCache]
      * invalidates older translation caches on a mismatch.
-     * v2: figure lines excluded, title bands merged, bylines isolated.
+     * v3: multi-line byline grouping, figure caption splitting, robust band ordering.
      */
-    const val LAYOUT_SCHEMA_VERSION = 2
+    const val LAYOUT_SCHEMA_VERSION = 3
 
     /** A line counts as figure text when at least this share of it lies
      *  inside a placed image. */
-    private const val IMAGE_OVERLAP_THRESHOLD = 0.5f
+    private const val IMAGE_OVERLAP_THRESHOLD = 0.20f
 
     /** Fallback figure-label test: a line shorter (in height) than this
      *  share of the body size with at most [FIGURE_FRAGMENT_MAX_WORDS]
@@ -82,6 +82,7 @@ object PdfBlockExtractor {
     private val WHITESPACE = Regex("\\s+")
     private val NAME_WORD = Regex("[A-Z][a-z]+")
     private val INITIAL = Regex("[A-Z]\\.?")
+    private val FIGURE_CAPTION_START = Regex("^(Figure|Fig\\.|Table)\\s*\\d+", RegexOption.IGNORE_CASE)
 
     fun blocksFromPageText(page: PageText): List<TextBlock> =
         groupLines(page).mapIndexed { i, lines -> makeBlock(lines, i) }
@@ -161,21 +162,54 @@ object PdfBlockExtractor {
      * letting one join the title band above or the abstract below smears
      * the author names through the neighbouring translation.
      */
+    /**
+     * Heuristic for an author byline: a run of person names (capitalized words
+     * and initials, often with superscript affiliation digits and separators like commas or &).
+     * Bylines always become standalone blocks — letting one join the title band above
+     * or the abstract below smears the author names through the neighbouring translation.
+     */
     fun isBylineLine(text: String): Boolean {
         val t = text.trim()
-        if (t.length < 15 || t.count { it == ',' } < 2) return false
-        val tokens = t.split(WHITESPACE).map { it.trim(',', '&', '＆', '*') }
-        if (tokens.size < 5) return false
+        if (t.length < 10) return false
+        val hasSeparator = t.contains(',') || t.contains('&') || t.contains('＆')
+        if (!hasSeparator) return false
+        val tokens = t.split(WHITESPACE).map { it.trim(',', '&', '＆', '*', '†', '‡') }.filter { it.isNotEmpty() }
+        if (tokens.size < 3) return false
         val nameLike = tokens.count { token ->
-            val core = token.trimEnd { ch -> ch.isDigit() || ch == ',' || ch == '*' }
+            val core = token.trimEnd { ch -> ch.isDigit() || ch == ',' || ch == '*' || ch == '†' || ch == '‡' }
             core.matches(NAME_WORD) || core.matches(INITIAL)
         }
-        return nameLike >= 4 && nameLike * 2 >= tokens.size
+        return nameLike >= 3 && nameLike * 2 >= tokens.size
+    }
+
+    /**
+     * Heuristic for trailing lines of an author byline (e.g. "Chandra L Tucker2").
+     */
+    fun isBylineContinuation(text: String): Boolean {
+        val t = text.trim()
+        if (t.isEmpty() || t.length > 100) return false
+        val tokens = t.split(WHITESPACE).map { it.trim(',', '&', '＆', '*', '†', '‡') }.filter { it.isNotEmpty() }
+        if (tokens.isEmpty() || tokens.size > 10) return false
+        val nameLike = tokens.count { token ->
+            val core = token.trimEnd { ch -> ch.isDigit() || ch == ',' || ch == '*' || ch == '†' || ch == '‡' }
+            core.matches(NAME_WORD) || core.matches(INITIAL)
+        }
+        return nameLike >= 2 && nameLike >= tokens.size - 1
+    }
+
+    /**
+     * True if the block consists entirely of author byline lines.
+     */
+    fun isBylineBlock(text: String): Boolean {
+        val lines = text.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        if (lines.isEmpty()) return false
+        return lines.all { isBylineLine(it) || isBylineContinuation(it) } &&
+            lines.any { isBylineLine(it) }
     }
 
     /**
      * Reading order with full-width groups: a full-width group (title,
-     * abstract) acts as a horizontal band boundary — column groups below
+     * abstract, figure caption) acts as a horizontal band boundary — column groups below
      * it come after it, and within one band the left column is read
      * before the right column.
      */
@@ -196,12 +230,17 @@ object PdfBlockExtractor {
             val top: Float,
             val left: Float
         )
+        val sortedFull = fullGroups.sortedBy { topOf(it) }
         val entries = mutableListOf<Entry>()
-        fullGroups.forEachIndexed { i, g -> entries += Entry(g, i, 0, 0, topOf(g), leftOf(g)) }
+        sortedFull.forEachIndexed { i, g ->
+            // Full-width groups get odd bands: 1, 3, 5, ...
+            entries += Entry(g, 2 * i + 1, 0, 0, topOf(g), leftOf(g))
+        }
         columnGroups.forEachIndexed { col, groups ->
             for (g in groups) {
-                val band = fullGroups.count { f -> bottomOf(f) <= topOf(g) + 0.001f }
-                entries += Entry(g, band, 1, col, topOf(g), leftOf(g))
+                // Column groups get even bands based on how many full-width groups are above them: 0, 2, 4, ...
+                val aboveCount = sortedFull.count { f -> bottomOf(f) <= topOf(g) + 0.001f }
+                entries += Entry(g, 2 * aboveCount, 1, col, topOf(g), leftOf(g))
             }
         }
         return entries
@@ -360,20 +399,38 @@ object PdfBlockExtractor {
         if (lines.isEmpty()) return emptyList()
         val groups = mutableListOf<List<TextLine>>()
         var current = mutableListOf<TextLine>()
+        var inByline = false
 
         fun flush() {
             if (current.isNotEmpty()) {
                 groups += current.toList()
                 current = mutableListOf()
             }
+            inByline = false
         }
 
         for (line in lines) {
-            if (isBylineLine(line.text)) {
-                flush()
-                groups += listOf(line)
+            val text = line.text
+            if (isBylineLine(text)) {
+                if (!inByline) {
+                    flush()
+                    inByline = true
+                }
+                current.add(line)
                 continue
+            } else if (inByline && isBylineContinuation(text)) {
+                val prev = current.lastOrNull()
+                val gap = if (prev != null) line.relY - (prev.relY + prev.relHeight) else 0f
+                if (prev != null && gap < prev.relHeight * 1.5f) {
+                    current.add(line)
+                    continue
+                }
             }
+
+            if (inByline) {
+                flush()
+            }
+
             val prev = current.lastOrNull()
             if (prev != null && shouldSplit(current, prev, line, bodyHeight)) flush()
             current.add(line)
@@ -388,6 +445,7 @@ object PdfBlockExtractor {
         line: TextLine,
         bodyHeight: Float
     ): Boolean {
+        if (FIGURE_CAPTION_START.containsMatchIn(line.text.trim())) return true
         val gap = line.relY - (prev.relY + prev.relHeight)
         // A line whose size differs sharply from the running cluster (or
         // from its immediate neighbour) starts a new block — this is what

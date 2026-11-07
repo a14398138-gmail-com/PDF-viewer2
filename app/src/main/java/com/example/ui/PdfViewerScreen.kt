@@ -1256,10 +1256,9 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawTranslatedBlock
     // Erase rect: block rect plus padding (title-size glyphs included), so
     // no source character peeks out from under the translation. The
     // padding scales with the block's line height — i.e. with the source
-    // font size — and the vertical share is generous because display type
-    // has tall ascenders/descenders relative to its line box.
-    val padX = max(2f, avgLineHPx * 0.35f)
-    val padY = max(2f, avgLineHPx * 0.35f)
+    // font size — and padX is kept moderate so it does not bleed across column gutters.
+    val padX = max(2f, avgLineHPx * 0.15f)
+    val padY = max(2f, avgLineHPx * 0.25f)
     val eraseLeft = (b.relX * pageW - padX).coerceAtLeast(0f)
     val eraseTop = (b.relY * pageH - padY).coerceAtLeast(0f)
     val eraseRight = ((b.relX + b.relWidth) * pageW + padX).coerceAtMost(pageW)

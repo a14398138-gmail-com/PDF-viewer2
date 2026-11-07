@@ -151,6 +151,14 @@ private class ImageRectCollector(page: PDPage) : PDFGraphicsStreamEngine(page) {
     override fun shadingFill(shadingName: COSName) = Unit
 }
 
+private data class ExtractedWord(
+    val text: String,
+    val relX: Float,
+    val relY: Float,
+    val relWidth: Float,
+    val relHeight: Float
+)
+
 object PdfTextExtractor {
     private const val TAG = "PdfTextExtractor"
     private var isPdfBoxInitialized = false
@@ -294,15 +302,13 @@ object PdfTextExtractor {
                 override fun writeString(text: String, textPositions: MutableList<TextPosition>) {
                     if (text.isBlank() || textPositions.isEmpty()) return
 
-                    fullTextSb.append(text).append("\n")
-
                     var curWordSb = StringBuilder()
                     var curWordLeft = Float.MAX_VALUE
                     var curWordTop = Float.MAX_VALUE
                     var curWordRight = Float.MIN_VALUE
                     var curWordBottom = Float.MIN_VALUE
 
-                    val lineWords = mutableListOf<TextWord>()
+                    val rawWords = mutableListOf<ExtractedWord>()
 
                     fun flushWord() {
                         if (curWordSb.isNotEmpty() && curWordLeft < curWordRight && curWordTop < curWordBottom) {
@@ -311,17 +317,15 @@ object PdfTextExtractor {
                             val relW = ((curWordRight - curWordLeft) / pWidth).coerceIn(0.005f, 1f)
                             val relH = ((curWordBottom - curWordTop) / pHeight).coerceIn(0.005f, 1f)
 
-                            val word = TextWord(
-                                index = wordGlobalIdx++,
-                                text = curWordSb.toString(),
-                                relX = relX,
-                                relY = relY,
-                                relWidth = relW,
-                                relHeight = relH,
-                                lineIndex = lineGlobalIdx
+                            rawWords.add(
+                                ExtractedWord(
+                                    text = curWordSb.toString(),
+                                    relX = relX,
+                                    relY = relY,
+                                    relWidth = relW,
+                                    relHeight = relH
+                                )
                             )
-                            lineWords.add(word)
-                            words.add(word)
                         }
                         curWordSb = StringBuilder()
                         curWordLeft = Float.MAX_VALUE
@@ -351,17 +355,15 @@ object PdfTextExtractor {
                                 val relW = ((right - x) / pWidth).coerceIn(0.005f, 1f)
                                 val relH = ((bottom - top) / pHeight).coerceIn(0.005f, 1f)
 
-                                val word = TextWord(
-                                    index = wordGlobalIdx++,
-                                    text = ch.toString(),
-                                    relX = relX,
-                                    relY = relY,
-                                    relWidth = relW,
-                                    relHeight = relH,
-                                    lineIndex = lineGlobalIdx
+                                rawWords.add(
+                                    ExtractedWord(
+                                        text = ch.toString(),
+                                        relX = relX,
+                                        relY = relY,
+                                        relWidth = relW,
+                                        relHeight = relH
+                                    )
                                 )
-                                lineWords.add(word)
-                                words.add(word)
                             } else {
                                 // Accumulate English / alphanumeric words
                                 curWordSb.append(ch)
@@ -380,24 +382,68 @@ object PdfTextExtractor {
                     }
                     flushWord()
 
-                    if (lineWords.isNotEmpty()) {
-                        val lineLeft = lineWords.minOf { it.relX }
-                        val lineTop = lineWords.minOf { it.relY }
-                        val lineRight = lineWords.maxOf { it.relX + it.relWidth }
-                        val lineBottom = lineWords.maxOf { it.relY + it.relHeight }
+                    if (rawWords.isEmpty()) return
+
+                    // Sort words left-to-right
+                    val sortedRaw = rawWords.sortedBy { it.relX }
+
+                    // Segment line on large horizontal gaps (e.g. column gutters between title & standfirst)
+                    val segments = mutableListOf<MutableList<ExtractedWord>>()
+                    var currentSegment = mutableListOf<ExtractedWord>()
+
+                    for (w in sortedRaw) {
+                        if (currentSegment.isEmpty()) {
+                            currentSegment.add(w)
+                        } else {
+                            val prev = currentSegment.last()
+                            val gap = w.relX - (prev.relX + prev.relWidth)
+                            val maxH = max(prev.relHeight, w.relHeight)
+                            val gapThreshold = max(0.025f, maxH * 1.2f)
+                            if (gap >= gapThreshold) {
+                                segments.add(currentSegment)
+                                currentSegment = mutableListOf(w)
+                            } else {
+                                currentSegment.add(w)
+                            }
+                        }
+                    }
+                    if (currentSegment.isNotEmpty()) {
+                        segments.add(currentSegment)
+                    }
+
+                    for (seg in segments) {
+                        val segWords = seg.map { ew ->
+                            val tw = TextWord(
+                                index = wordGlobalIdx++,
+                                text = ew.text,
+                                relX = ew.relX,
+                                relY = ew.relY,
+                                relWidth = ew.relWidth,
+                                relHeight = ew.relHeight,
+                                lineIndex = lineGlobalIdx
+                            )
+                            words.add(tw)
+                            tw
+                        }
+                        val segText = joinWords(segWords)
+                        val lineLeft = segWords.minOf { it.relX }
+                        val lineTop = segWords.minOf { it.relY }
+                        val lineRight = segWords.maxOf { it.relX + it.relWidth }
+                        val lineBottom = segWords.maxOf { it.relY + it.relHeight }
 
                         lines.add(
                             TextLine(
                                 lineIndex = lineGlobalIdx,
-                                text = text,
+                                text = segText,
                                 relX = lineLeft,
                                 relY = lineTop,
                                 relWidth = lineRight - lineLeft,
                                 relHeight = lineBottom - lineTop,
-                                words = lineWords
+                                words = segWords
                             )
                         )
                         lineGlobalIdx++
+                        fullTextSb.append(segText).append("\n")
                     }
                 }
             }
@@ -617,14 +663,19 @@ object PdfTextExtractor {
                 ub == Character.UnicodeBlock.HALFWIDTH_AND_FULLWIDTH_FORMS
     }
 
-    fun formatSelectedWords(words: List<TextWord>, indices: Set<Int>): String {
-        val sorted = indices.sorted().mapNotNull { words.getOrNull(it) }
-        if (sorted.isEmpty()) return ""
+    /**
+     * Joins a list of TextWord instances into flowing natural text:
+     * - Preserves spaces between Latin/alphanumeric words
+     * - Joins CJK characters without spaces
+     * - Reconnects hyphenated words across line wraps (e.g. "inter-" + "national" -> "international")
+     */
+    fun joinWords(words: List<TextWord>): String {
+        if (words.isEmpty()) return ""
         val sb = StringBuilder()
-        for (i in sorted.indices) {
-            val cur = sorted[i]
+        for (i in words.indices) {
+            val cur = words[i]
             if (i > 0) {
-                val prev = sorted[i - 1]
+                val prev = words[i - 1]
                 val prevLastChar = prev.text.lastOrNull()
                 val curFirstChar = cur.text.firstOrNull()
                 val isPrevCjk = prevLastChar != null && isCjkChar(prevLastChar)
@@ -642,6 +693,11 @@ object PdfTextExtractor {
             sb.append(cur.text)
         }
         return sb.toString()
+    }
+
+    fun formatSelectedWords(words: List<TextWord>, indices: Set<Int>): String {
+        val sorted = indices.sorted().mapNotNull { words.getOrNull(it) }
+        return joinWords(sorted)
     }
 
     /**

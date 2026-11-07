@@ -89,6 +89,25 @@ class PdfTextExtractorTest {
         assertEquals("", PdfTextExtractor.formatSelectedWords(words, setOf(99)))
     }
 
+    // ---- joinWords() --------------------------------------------------------
+
+    @Test
+    fun joinWordsJoinsLatinWithSpaceAndRepairsHyphenation() {
+        val words = listOf(
+            word(0, "Rapid"),
+            word(1, "blue-light-"),
+            word(2, "mediated"),
+            word(3, "induction")
+        )
+        assertEquals("Rapid blue-light-mediated induction", PdfTextExtractor.joinWords(words))
+    }
+
+    @Test
+    fun joinWordsJoinsCjkWithoutSpaces() {
+        val words = listOf(word(0, "日"), word(1, "本"), word(2, "語"))
+        assertEquals("日本語", PdfTextExtractor.joinWords(words))
+    }
+
     // ---- cleanPdfExtractedText() --------------------------------------------
 
     @Test

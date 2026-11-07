@@ -297,4 +297,74 @@ class PdfBlockExtractorTest {
             .flatten().map { it.lineIndex }.sorted()
         assertEquals(listOf(0, 1, 2), assigned)
     }
+
+    @Test
+    fun multiLineBylineGroupedTogether() {
+        val lines = listOf(
+            line(0, "A Grand Unified Paper Title", 0.08f, 0.05f, 0.84f, h = 0.034f),
+            line(1, "Matthew J Kennedy1,4, Robert M Hughes2,4, Leslie A Peteya2,", 0.08f, 0.09f, 0.84f),
+            line(2, "Margaux B Margolis2, Michael E Allen2 &", 0.08f, 0.11f, 0.84f),
+            line(3, "Chandra L Tucker2", 0.08f, 0.13f, 0.84f),
+            line(4, "We report a new method for doing", 0.08f, 0.17f, 0.84f),
+            line(5, "things with proteins in cells.", 0.08f, 0.195f, 0.84f)
+        )
+        val blocks = PdfBlockExtractor.blocksFromPageText(page(lines))
+        assertEquals(3, blocks.size)
+        assertEquals("A Grand Unified Paper Title", blocks[0].text)
+        assertTrue(blocks[1].text.contains("Kennedy"))
+        assertTrue(blocks[1].text.contains("Tucker"))
+        assertTrue(PdfBlockExtractor.isBylineBlock(blocks[1].text))
+        assertEquals(3, blocks[1].lineCount)
+        assertTrue(blocks[2].text.startsWith("We report"))
+        assertTrue(!PdfBlockExtractor.isBylineBlock(blocks[2].text))
+    }
+
+    @Test
+    fun twoColumnTitleAndStandfirstSeparated() {
+        val lines = listOf(
+            // Left column: Title lines
+            line(0, "Rapid blue-light-mediated", 0.08f, 0.10f, 0.36f, h = 0.03f),
+            line(1, "induction of protein", 0.08f, 0.135f, 0.36f, h = 0.03f),
+            line(2, "interactions in living cells", 0.08f, 0.17f, 0.36f, h = 0.03f),
+            // Right column: Standfirst lines interleaved in Y
+            line(3, "Reversible protein interactions on a", 0.56f, 0.10f, 0.36f, h = 0.02f),
+            line(4, "subsecond timescale enable the study of", 0.56f, 0.125f, 0.36f, h = 0.02f),
+            line(5, "dynamic cell biological processes.", 0.56f, 0.15f, 0.36f, h = 0.02f)
+        )
+        val blocks = PdfBlockExtractor.blocksFromPageText(page(lines))
+        assertEquals(2, blocks.size)
+        assertTrue(blocks[0].text.startsWith("Rapid blue-light-mediated"))
+        assertTrue(blocks[0].relX < 0.5f)
+        assertTrue(blocks[1].text.startsWith("Reversible protein interactions"))
+        assertTrue(blocks[1].relX > 0.5f)
+    }
+
+    @Test
+    fun figureCaptionStartsOwnBlock() {
+        val lines = listOf(
+            line(0, "Dimerizers allowing rapid and reversible control.", 0.08f, 0.30f, 0.36f),
+            line(1, "Figure 2 | Rapid reversible dimerizer recruitment.", 0.08f, 0.33f, 0.36f),
+            line(2, "(a) Schematic illustration of light-mediated dimerization.", 0.08f, 0.355f, 0.36f)
+        )
+        val blocks = PdfBlockExtractor.blocksFromPageText(page(lines))
+        assertEquals(2, blocks.size)
+        assertEquals("Dimerizers allowing rapid and reversible control.", blocks[0].text)
+        assertTrue(blocks[1].text.startsWith("Figure 2"))
+    }
+
+    @Test
+    fun orderGroupsPlacesBottomFullGroupAfterColumns() {
+        val fullTop = line(0, "Top Full Title", 0.08f, 0.05f, 0.84f, h = 0.03f)
+        val leftCol = (0 until 3).map { line(1 + it, "Left body line $it", 0.08f, 0.20f + it * 0.03f, 0.36f) }
+        val rightCol = (0 until 3).map { line(4 + it, "Right body line $it", 0.56f, 0.20f + it * 0.03f, 0.36f) }
+        val fullBottom = line(7, "Figure 2 | Full-width caption spanning both columns", 0.08f, 0.85f, 0.84f, h = 0.02f)
+
+        val allLines = listOf(fullTop) + leftCol + rightCol + listOf(fullBottom)
+        val blocks = PdfBlockExtractor.blocksFromPageText(page(allLines))
+        assertEquals(4, blocks.size)
+        assertEquals("Top Full Title", blocks[0].text)
+        assertTrue(blocks[1].text.startsWith("Left body line"))
+        assertTrue(blocks[2].text.startsWith("Right body line"))
+        assertTrue(blocks[3].text.startsWith("Figure 2"))
+    }
 }
