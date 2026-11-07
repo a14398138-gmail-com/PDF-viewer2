@@ -19,6 +19,14 @@ object PdfTextCache {
     private const val TAG = "PdfTextCache"
     private const val DIR_NAME = "text_cache"
 
+    /**
+     * Version of the page-cache payload. v2 adds the placed-image
+     * rectangles the block extractor needs to keep figure text out of
+     * translations; older entries are treated as misses so pages are
+     * re-extracted once with the new data.
+     */
+    private const val PAGE_SCHEMA_VERSION = 2
+
     fun keyFor(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().use { input ->
@@ -42,6 +50,7 @@ object PdfTextCache {
         if (!file.exists() || file.length() == 0L) return null
         return try {
             val json = JSONObject(file.readText())
+            if (json.optInt("schema", 1) != PAGE_SCHEMA_VERSION) return null
             val words = mutableListOf<TextWord>()
             val wordsArray = json.optJSONArray("words") ?: JSONArray()
             for (i in 0 until wordsArray.length()) {
@@ -73,13 +82,27 @@ object PdfTextCache {
                         words = lineWords
                     )
                 }
+            val images = mutableListOf<RelRect>()
+            val imagesArray = json.optJSONArray("images") ?: JSONArray()
+            for (i in 0 until imagesArray.length()) {
+                val r = imagesArray.getJSONObject(i)
+                images.add(
+                    RelRect(
+                        relX = r.optDouble("relX", 0.0).toFloat(),
+                        relY = r.optDouble("relY", 0.0).toFloat(),
+                        relWidth = r.optDouble("relWidth", 0.0).toFloat(),
+                        relHeight = r.optDouble("relHeight", 0.0).toFloat()
+                    )
+                )
+            }
             PageText(
                 pageIndex = pageIndex,
                 fullText = fullText,
                 paragraphs = if (fullText.isBlank()) emptyList() else listOf(fullText),
                 lines = lines,
                 words = words,
-                isNativeTextLayer = json.optBoolean("isNative", false)
+                isNativeTextLayer = json.optBoolean("isNative", false),
+                imageRects = images
             )
         } catch (e: Exception) {
             Log.w(TAG, "Failed to read cached text for page $pageIndex: ${e.message}")
@@ -105,6 +128,13 @@ object PdfTextCache {
         if (!file.exists() || file.length() == 0L) return emptyMap()
         return try {
             val json = JSONObject(file.readText())
+            // Translations are keyed by block index, which only has meaning
+            // for one block-splitting schema. Entries written by an older
+            // layout schema would resurface attached to unrelated blocks,
+            // so they are invalidated wholesale.
+            if (json.optInt("schema", 1) != PdfBlockExtractor.LAYOUT_SCHEMA_VERSION) {
+                return emptyMap()
+            }
             val result = mutableMapOf<Int, Pair<String, String>>()
             val keys = json.keys()
             while (keys.hasNext()) {
@@ -136,11 +166,16 @@ object PdfTextCache {
         try {
             val file = translationFile(context, key, pageIndex)
             file.parentFile?.mkdirs()
-            val json = if (file.exists() && file.length() > 0L) {
+            var json = if (file.exists() && file.length() > 0L) {
                 try { JSONObject(file.readText()) } catch (_: Exception) { JSONObject() }
             } else {
                 JSONObject()
             }
+            if (json.optInt("schema", 1) != PdfBlockExtractor.LAYOUT_SCHEMA_VERSION) {
+                // Stale-schema entries must not linger next to new ones.
+                json = JSONObject()
+            }
+            json.put("schema", PdfBlockExtractor.LAYOUT_SCHEMA_VERSION)
             json.put(
                 blockIndex.toString(),
                 JSONObject().apply {
@@ -180,10 +215,23 @@ object PdfTextCache {
                     }
                 )
             }
+            val imagesArray = JSONArray()
+            for (rect in pageText.imageRects) {
+                imagesArray.put(
+                    JSONObject().apply {
+                        put("relX", rect.relX.toDouble())
+                        put("relY", rect.relY.toDouble())
+                        put("relWidth", rect.relWidth.toDouble())
+                        put("relHeight", rect.relHeight.toDouble())
+                    }
+                )
+            }
             val json = JSONObject().apply {
+                put("schema", PAGE_SCHEMA_VERSION)
                 put("fullText", pageText.fullText)
                 put("isNative", pageText.isNativeTextLayer)
                 put("words", wordsArray)
+                put("images", imagesArray)
             }
             val tmp = File(file.parentFile, file.name + ".tmp")
             tmp.writeText(json.toString())

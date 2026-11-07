@@ -10,7 +10,12 @@ import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import com.tom_roush.pdfbox.contentstream.PDFGraphicsStreamEngine
+import com.tom_roush.pdfbox.cos.COSName
 import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.pdmodel.PDPage
+import com.tom_roush.pdfbox.pdmodel.common.PDRectangle
+import com.tom_roush.pdfbox.pdmodel.graphics.image.PDImage
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import com.tom_roush.pdfbox.text.TextPosition
 import kotlinx.coroutines.Dispatchers
@@ -42,6 +47,14 @@ data class TextLine(
     val words: List<TextWord> = emptyList()
 )
 
+/** An axis-aligned rectangle in normalized page coordinates (0..1). */
+data class RelRect(
+    val relX: Float,
+    val relY: Float,
+    val relWidth: Float,
+    val relHeight: Float
+)
+
 data class PageText(
     val pageIndex: Int,
     val fullText: String,
@@ -49,6 +62,10 @@ data class PageText(
     val lines: List<TextLine> = emptyList(),
     val words: List<TextWord> = emptyList(),
     val isNativeTextLayer: Boolean = false,
+    /** Placed-image rectangles (XObject and inline images) in normalized
+     *  page coordinates. Text sitting on top of these is figure content,
+     *  not body text; the block extractor excludes it from translation. */
+    val imageRects: List<RelRect> = emptyList(),
     val lowerText: String = fullText.lowercase()
 )
 
@@ -80,6 +97,58 @@ class PdfTextExtractionSession(
             Log.w("PdfExtractionSession", "Error closing PDDocument: ${e.message}")
         }
     }
+}
+
+/**
+ * Walks a page's content stream and records the user-space bounding box of
+ * every drawn image (the current transformation matrix maps the unit
+ * square onto the image's placement rectangle). All path/paint callbacks
+ * are no-ops; only image placements are of interest.
+ */
+private class ImageRectCollector(page: PDPage) : PDFGraphicsStreamEngine(page) {
+
+    /** [minX, minY, maxX, maxY] in page user space (y-up). */
+    val userRects = mutableListOf<FloatArray>()
+
+    override fun drawImage(image: PDImage) {
+        try {
+            val ctm = graphicsState.currentTransformationMatrix
+            val corners = listOf(
+                ctm.transformPoint(0f, 0f),
+                ctm.transformPoint(1f, 0f),
+                ctm.transformPoint(1f, 1f),
+                ctm.transformPoint(0f, 1f)
+            )
+            val minX = corners.minOf { it.x }
+            val minY = corners.minOf { it.y }
+            val maxX = corners.maxOf { it.x }
+            val maxY = corners.maxOf { it.y }
+            if (maxX > minX && maxY > minY) {
+                userRects.add(floatArrayOf(minX, minY, maxX, maxY))
+            }
+        } catch (e: Exception) {
+            // A single bad placement must not lose the rest of the page.
+        }
+    }
+
+    override fun appendRectangle(
+        p0: android.graphics.PointF,
+        p1: android.graphics.PointF,
+        p2: android.graphics.PointF,
+        p3: android.graphics.PointF
+    ) = Unit
+
+    override fun clip(rule: android.graphics.Path.FillType) = Unit
+    override fun moveTo(x: Float, y: Float) = Unit
+    override fun lineTo(x: Float, y: Float) = Unit
+    override fun curveTo(x1: Float, y1: Float, x2: Float, y2: Float, x3: Float, y3: Float) = Unit
+    override fun getCurrentPoint(): android.graphics.PointF = android.graphics.PointF(0f, 0f)
+    override fun closePath() = Unit
+    override fun endPath() = Unit
+    override fun strokePath() = Unit
+    override fun fillPath(rule: android.graphics.Path.FillType) = Unit
+    override fun fillAndStrokePath(rule: android.graphics.Path.FillType) = Unit
+    override fun shadingFill(shadingName: COSName) = Unit
 }
 
 object PdfTextExtractor {
@@ -126,6 +195,75 @@ object PdfTextExtractor {
         } catch (e: Exception) {
             Log.w(TAG, "Failed to load PDDocument for session: ${e.message}")
             PdfTextExtractionSession(file, null)
+        }
+    }
+
+    /**
+     * Glyph box [left, top, right, bottom] of one [TextPosition] in page
+     * user-space points. The vertical extent comes from the font's
+     * ascent/descent (scaled by the em size, for which heightDir is the
+     * display-space proxy) instead of assuming the whole em square sits
+     * above the baseline — the old assumption under-covered large display
+     * type, whose glyphs then peeked out from under the translation
+     * overlay's erase rectangle. Falls back to the old formula when the
+     * font carries no usable descriptor metrics.
+     */
+    private fun glyphBox(tp: TextPosition): FloatArray {
+        val baseline = tp.yDirAdj
+        var top = baseline - tp.heightDir
+        var bottom = baseline
+        try {
+            val descriptor = tp.font?.fontDescriptor
+            val em = tp.heightDir
+            if (descriptor != null && em > 0f) {
+                val ascent = descriptor.ascent
+                val descent = descriptor.descent
+                if (ascent > 0f && descent < ascent) {
+                    // Descriptor metrics are in 1000-unit glyph space.
+                    val ascTop = baseline - em * (ascent / 1000f)
+                    val descBottom = baseline - em * (descent / 1000f)
+                    if (descBottom > ascTop) {
+                        top = ascTop
+                        bottom = descBottom
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // Keep the fallback box.
+        }
+        return floatArrayOf(tp.xDirAdj, top, tp.xDirAdj + tp.widthDirAdj, bottom)
+    }
+
+    /**
+     * Collects the placed-image rectangles of [page] (image XObjects and
+     * inline images, including images nested in form XObjects) as
+     * normalized [RelRect]s. Rectangles covering almost the whole page are
+     * dropped: they are background/watermark art, and treating them as
+     * figures would exclude every line of text on the page.
+     */
+    private fun collectPageImageRects(page: PDPage, cropBox: PDRectangle): List<RelRect> {
+        val pWidth = cropBox.width.coerceAtLeast(1f)
+        val pHeight = cropBox.height.coerceAtLeast(1f)
+        val llx = cropBox.lowerLeftX
+        val lly = cropBox.lowerLeftY
+        return try {
+            val collector = ImageRectCollector(page)
+            collector.processPage(page)
+            collector.userRects.mapNotNull { r ->
+                val relX = ((r[0] - llx) / pWidth).coerceIn(0f, 1f)
+                val relW = ((r[2] - r[0]) / pWidth).coerceIn(0f, 1f)
+                val relH = ((r[3] - r[1]) / pHeight).coerceIn(0f, 1f)
+                // User space is y-up; normalized page space is y-down.
+                val relY = (1f - ((r[3] - lly) / pHeight)).coerceIn(0f, 1f)
+                if (relW <= 0f || relH <= 0f || relW * relH > 0.85f) {
+                    null
+                } else {
+                    RelRect(relX, relY, relW, relH)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Image rectangle collection failed: ${e.message}")
+            emptyList()
         }
     }
 
@@ -202,10 +340,11 @@ object PdfTextExtractor {
                                 flushWord()
 
                                 // Create individual 1-character TextWord for Japanese/CJK
-                                val x = tp.xDirAdj
-                                val top = tp.yDirAdj - tp.heightDir
-                                val right = tp.xDirAdj + tp.widthDirAdj
-                                val bottom = tp.yDirAdj
+                                val box = glyphBox(tp)
+                                val x = box[0]
+                                val top = box[1]
+                                val right = box[2]
+                                val bottom = box[3]
 
                                 val relX = (x / pWidth).coerceIn(0f, 1f)
                                 val relY = (top / pHeight).coerceIn(0f, 1f)
@@ -226,10 +365,11 @@ object PdfTextExtractor {
                             } else {
                                 // Accumulate English / alphanumeric words
                                 curWordSb.append(ch)
-                                val x = tp.xDirAdj
-                                val top = tp.yDirAdj - tp.heightDir
-                                val right = tp.xDirAdj + tp.widthDirAdj
-                                val bottom = tp.yDirAdj
+                                val box = glyphBox(tp)
+                                val x = box[0]
+                                val top = box[1]
+                                val right = box[2]
+                                val bottom = box[3]
 
                                 curWordLeft = min(curWordLeft, x)
                                 curWordTop = min(curWordTop, top)
@@ -272,7 +412,8 @@ object PdfTextExtractor {
                     paragraphs = listOf(fullText),
                     lines = lines,
                     words = words,
-                    isNativeTextLayer = true
+                    isNativeTextLayer = true,
+                    imageRects = collectPageImageRects(page, cropBox)
                 )
             } else {
                 null

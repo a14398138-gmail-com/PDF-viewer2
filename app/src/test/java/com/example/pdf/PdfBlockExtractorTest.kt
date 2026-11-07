@@ -166,4 +166,135 @@ class PdfBlockExtractorTest {
         assertTrue(chunks.all { it.length <= 500 })
         assertEquals(text, chunks.joinToString(""))
     }
+
+    // ---- v1.2.2: figure exclusion, title bands, bylines, partition ------
+
+    private fun pageWithImages(lines: List<TextLine>, images: List<RelRect>) = PageText(
+        pageIndex = 0,
+        fullText = lines.joinToString("\n") { it.text },
+        lines = lines,
+        isNativeTextLayer = true,
+        imageRects = images
+    )
+
+    @Test
+    fun figureLinesInsideImagesAreExcluded() {
+        val lines = listOf(
+            line(0, "Body text begins here with", 0.1f, 0.10f, 0.8f),
+            line(1, "a second line of the body", 0.1f, 0.125f, 0.8f),
+            line(2, "and a third body line.", 0.1f, 0.15f, 0.8f),
+            // A label drawn on top of a placed image (microscopy panel).
+            line(3, "CIBN-pmEGFP", 0.2f, 0.50f, 0.2f)
+        )
+        val images = listOf(RelRect(relX = 0.1f, relY = 0.45f, relWidth = 0.5f, relHeight = 0.2f))
+        val blocks = PdfBlockExtractor.blocksFromPageText(pageWithImages(lines, images))
+        assertEquals(1, blocks.size)
+        assertTrue(blocks.none { it.text.contains("CIBN") })
+    }
+
+    @Test
+    fun shortSmallFragmentsAreExcludedAsFigureLabels() {
+        val lines = listOf(
+            line(0, "Body text begins here with", 0.1f, 0.10f, 0.8f),
+            line(1, "a second line of the body", 0.1f, 0.125f, 0.8f),
+            line(2, "and a third body line.", 0.1f, 0.15f, 0.8f),
+            // Axis / scale fragment of a vector-drawn figure: small + short.
+            line(3, "488 nm", 0.7f, 0.50f, 0.1f, h = 0.011f)
+        )
+        val blocks = PdfBlockExtractor.blocksFromPageText(page(lines))
+        assertEquals(1, blocks.size)
+        assertTrue(blocks.none { it.text.contains("488") })
+    }
+
+    @Test
+    fun smallButLongLinesAreKept() {
+        val lines = listOf(
+            line(0, "Body text begins here with", 0.1f, 0.10f, 0.8f),
+            line(1, "a second line of the body", 0.1f, 0.125f, 0.8f),
+            line(2, "and a third body line.", 0.1f, 0.15f, 0.8f),
+            // Footnote-size but a full sentence: must survive the fragment rule.
+            line(
+                3,
+                "Correspondence should be addressed to the corresponding author at the institute.",
+                0.1f, 0.90f, 0.8f, h = 0.013f
+            )
+        )
+        val blocks = PdfBlockExtractor.blocksFromPageText(page(lines))
+        assertEquals(2, blocks.size)
+        assertTrue(blocks[1].text.contains("Correspondence"))
+    }
+
+    @Test
+    fun titleBandWithTwoFontSizesMergesIntoOneBlock() {
+        val lines = mutableListOf<TextLine>()
+        // Two title lines whose sizes differ enough to trip the plain
+        // height-jump rule (0.040 vs 0.029, body size 0.02).
+        lines.add(line(0, "Rapid blue-light-mediated protein", 0.08f, 0.05f, 0.84f, h = 0.040f))
+        lines.add(line(1, "interactions in living cells", 0.08f, 0.098f, 0.84f, h = 0.029f))
+        for (i in 0 until 6) {
+            lines.add(line(2 + i, "Body line number $i of the abstract", 0.08f, 0.20f + i * 0.025f, 0.84f))
+        }
+        val blocks = PdfBlockExtractor.blocksFromPageText(page(lines))
+        assertEquals(2, blocks.size)
+        assertEquals(2, blocks[0].lineCount)
+        assertTrue(blocks[0].text.contains("living cells"))
+        assertEquals(6, blocks[1].lineCount)
+    }
+
+    @Test
+    fun bylineBetweenTitleAndAbstractStandsAlone() {
+        val byline = "Matthew J Kennedy1,4, Robert M Hughes2,4, Leslie A Peteya2, " +
+            "Joel W Schwartz1, Michael D Ehlers1,3 & Chandra L Tucker2"
+        val lines = listOf(
+            line(0, "A Grand Unified Paper Title", 0.08f, 0.05f, 0.84f, h = 0.034f),
+            line(1, byline, 0.08f, 0.10f, 0.84f),
+            line(2, "We report a new method for doing", 0.08f, 0.13f, 0.84f),
+            line(3, "things with proteins in cells.", 0.08f, 0.155f, 0.84f),
+            line(4, "The method is fast and reversible.", 0.08f, 0.18f, 0.84f)
+        )
+        val blocks = PdfBlockExtractor.blocksFromPageText(page(lines))
+        assertEquals(3, blocks.size)
+        assertEquals(byline, blocks[1].text)
+        assertTrue(blocks[2].text.startsWith("We report"))
+        assertTrue(!blocks[2].text.contains("Kennedy"))
+    }
+
+    @Test
+    fun ordinarySentencesAreNotBylines() {
+        assertTrue(
+            !PdfBlockExtractor.isBylineLine(
+                "However, the interaction requires a bilin cofactor, found only in plants, to function properly."
+            )
+        )
+        assertTrue(
+            PdfBlockExtractor.isBylineLine(
+                "Matthew J Kennedy1,4, Robert M Hughes2,4 & Chandra L Tucker2"
+            )
+        )
+    }
+
+    @Test
+    fun everyLineBelongsToExactlyOneGroup() {
+        val lines = mutableListOf<TextLine>()
+        lines.add(line(0, "A Very Long Paper Title", 0.08f, 0.05f, 0.84f, h = 0.03f))
+        for (i in 0 until 4) {
+            lines.add(line(1 + i * 2, "Left column line $i", 0.08f, 0.15f + i * 0.025f, 0.36f))
+            lines.add(line(2 + i * 2, "Right column line $i", 0.56f, 0.15f + i * 0.025f, 0.36f))
+        }
+        val assigned = PdfBlockExtractor.groupLines(page(lines))
+            .flatten().map { it.lineIndex }.sorted()
+        assertEquals(lines.map { it.lineIndex }.sorted(), assigned)
+    }
+
+    @Test
+    fun groupLinesExcludeOnlyFigureLines() {
+        val body = (0 until 3).map {
+            line(it, "Body line number $it here", 0.1f, 0.10f + it * 0.025f, 0.8f)
+        }
+        val label = line(3, "Panel A label", 0.2f, 0.50f, 0.2f)
+        val images = listOf(RelRect(0.1f, 0.45f, 0.5f, 0.2f))
+        val assigned = PdfBlockExtractor.groupLines(pageWithImages(body + label, images))
+            .flatten().map { it.lineIndex }.sorted()
+        assertEquals(listOf(0, 1, 2), assigned)
+    }
 }

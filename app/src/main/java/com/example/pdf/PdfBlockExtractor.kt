@@ -33,6 +33,9 @@ data class TranslatedBlock(
  * Groups the lines of a natively-extracted page into layout blocks without
  * breaking multi-column layouts:
  *
+ * 0. Figure text is removed first: lines sitting inside a placed image
+ *    (see [PageText.imageRects]) and short, small label fragments are
+ *    never blocked, translated, or painted over.
  * 1. A vertical "gutter" (an x-band almost no line crosses) splits the page
  *    into columns; lines are assigned to a column by their centre.
  * 2. Lines that cross the whole gutter (titles, author lines, a full-width
@@ -42,7 +45,10 @@ data class TranslatedBlock(
  * 3. Inside a column, lines are visited top-to-bottom and a new block starts
  *    when the vertical gap is large, the line height changes a lot (heading /
  *    caption vs. body), or the horizontal overlap with the running block is
- *    tiny (e.g. a centred caption under a figure).
+ *    tiny (e.g. a centred caption under a figure). Two refinements apply:
+ *    consecutive display-size lines merge into one title band even across
+ *    a size change, and an author byline always stands alone so it cannot
+ *    be absorbed into the title or the abstract.
  *
  * This is a pure function of [PageText] so it is unit-testable and reuses the
  * existing extraction pipeline (and its disk cache) instead of re-parsing the
@@ -50,43 +56,157 @@ data class TranslatedBlock(
  */
 object PdfBlockExtractor {
 
-    fun blocksFromPageText(page: PageText): List<TextBlock> {
-        val lines = page.lines
-            .filter { it.text.isNotBlank() && it.relWidth > 0f && it.relHeight > 0f }
-            .sortedWith(compareBy({ it.relY }, { it.relX }))
-        if (lines.isEmpty()) return emptyList()
+    /**
+     * Version of the block-splitting schema. Cached translations are keyed
+     * by block index, which only has meaning within one schema, so any
+     * change to how lines are grouped must bump this — [PdfTextCache]
+     * invalidates older translation caches on a mismatch.
+     * v2: figure lines excluded, title bands merged, bylines isolated.
+     */
+    const val LAYOUT_SCHEMA_VERSION = 2
 
+    /** A line counts as figure text when at least this share of it lies
+     *  inside a placed image. */
+    private const val IMAGE_OVERLAP_THRESHOLD = 0.5f
+
+    /** Fallback figure-label test: a line shorter (in height) than this
+     *  share of the body size with at most [FIGURE_FRAGMENT_MAX_WORDS]
+     *  words is treated as an axis tick / panel label fragment. */
+    private const val FIGURE_FRAGMENT_HEIGHT_RATIO = 0.8f
+    private const val FIGURE_FRAGMENT_MAX_WORDS = 3
+
+    /** Lines at least this much larger than the body size are display
+     *  type; consecutive ones form a single title/heading band. */
+    private const val TITLE_BAND_MIN_RATIO = 1.4f
+
+    private val WHITESPACE = Regex("\\s+")
+    private val NAME_WORD = Regex("[A-Z][a-z]+")
+    private val INITIAL = Regex("[A-Z]\\.?")
+
+    fun blocksFromPageText(page: PageText): List<TextBlock> =
+        groupLines(page).mapIndexed { i, lines -> makeBlock(lines, i) }
+
+    /**
+     * Partitions the page's translatable lines into block-sized groups in
+     * reading order. The partition is exact: every line that survives the
+     * figure exclusion belongs to precisely one group, so no body line can
+     * be silently dropped (leaving untranslated source text inside the
+     * translated overlay) or translated twice.
+     */
+    fun groupLines(page: PageText): List<List<TextLine>> {
+        val lines = translatableLines(page)
+        if (lines.isEmpty()) return emptyList()
+        val bodyHeight = medianHeight(lines)
         val split = splitColumns(lines)
-        val fullBlocks = clusterColumn(split.fullWidthLines)
-        val columnBlocks = split.columns.map { clusterColumn(it) }
-        val ordered = orderBlocks(fullBlocks, columnBlocks)
-        return ordered.mapIndexed { i, b -> b.copy(blockIndex = i) }
+        val fullGroups = clusterGroup(split.fullWidthLines, bodyHeight)
+        val columnGroups = split.columns.map { clusterGroup(it, bodyHeight) }
+        return orderGroups(fullGroups, columnGroups)
     }
 
     /**
-     * Reading order with full-width blocks: a full-width block (title,
-     * abstract) acts as a horizontal band boundary — column blocks below it
-     * come after it, and within one band the left column is read before the
-     * right column.
+     * The page's text lines minus figure content, sorted for clustering.
+     * Figure text (labels drawn on or around figures) is excluded from
+     * blocking entirely: it is never translated and never painted over.
      */
-    private fun orderBlocks(
-        fullBlocks: List<TextBlock>,
-        columnBlocks: List<List<TextBlock>>
-    ): List<TextBlock> {
-        if (fullBlocks.isEmpty()) return columnBlocks.flatten()
-        if (columnBlocks.isEmpty()) return fullBlocks
-        data class Entry(val block: TextBlock, val band: Int, val kind: Int, val col: Int)
+    private fun translatableLines(page: PageText): List<TextLine> {
+        val lines = page.lines
+            .filter { it.text.isNotBlank() && it.relWidth > 0f && it.relHeight > 0f }
+            .sortedWith(compareBy({ it.relY }, { it.relX }))
+        if (lines.isEmpty()) return lines
+        val bodyHeight = medianHeight(lines)
+        return lines.filterNot { isFigureLine(it, page.imageRects, bodyHeight) }
+    }
+
+    /** Median line height of [lines] — the proxy for the body font size. */
+    fun medianHeight(lines: List<TextLine>): Float {
+        if (lines.isEmpty()) return 0f
+        val sorted = lines.map { it.relHeight }.sorted()
+        return sorted[sorted.size / 2]
+    }
+
+    /**
+     * True for text that belongs to a figure rather than the article body:
+     * either at least half of the line lies inside a placed image, or it
+     * is a short, small fragment (axis tick, panel letter, scale-bar
+     * label) of the kind figures are labelled with. Fragment exclusion is
+     * deliberately conservative — a full sentence at body size never
+     * matches, whatever its word count.
+     */
+    fun isFigureLine(line: TextLine, imageRects: List<RelRect>, bodyHeight: Float): Boolean {
+        if (imageRects.any { imageOverlapRatio(line, it) >= IMAGE_OVERLAP_THRESHOLD }) {
+            return true
+        }
+        if (bodyHeight <= 0f) return false
+        if (line.relHeight >= bodyHeight * FIGURE_FRAGMENT_HEIGHT_RATIO) return false
+        val wordCount = line.text.trim().split(WHITESPACE).count { it.isNotEmpty() }
+        return wordCount <= FIGURE_FRAGMENT_MAX_WORDS
+    }
+
+    /** Intersection area of [line] and [image], divided by the line's area. */
+    fun imageOverlapRatio(line: TextLine, image: RelRect): Float {
+        val iw = min(line.relX + line.relWidth, image.relX + image.relWidth) -
+            max(line.relX, image.relX)
+        val ih = min(line.relY + line.relHeight, image.relY + image.relHeight) -
+            max(line.relY, image.relY)
+        if (iw <= 0f || ih <= 0f) return 0f
+        val area = line.relWidth * line.relHeight
+        if (area <= 0f) return 0f
+        return (iw * ih) / area
+    }
+
+    /**
+     * Heuristic for an author byline: a comma-separated run of person
+     * names (capitalized words and initials, often with superscript
+     * affiliation digits). Bylines always become standalone blocks —
+     * letting one join the title band above or the abstract below smears
+     * the author names through the neighbouring translation.
+     */
+    fun isBylineLine(text: String): Boolean {
+        val t = text.trim()
+        if (t.length < 15 || t.count { it == ',' } < 2) return false
+        val tokens = t.split(WHITESPACE).map { it.trim(',', '&', '＆', '*') }
+        if (tokens.size < 5) return false
+        val nameLike = tokens.count { token ->
+            val core = token.trimEnd { ch -> ch.isDigit() || ch == ',' || ch == '*' }
+            core.matches(NAME_WORD) || core.matches(INITIAL)
+        }
+        return nameLike >= 4 && nameLike * 2 >= tokens.size
+    }
+
+    /**
+     * Reading order with full-width groups: a full-width group (title,
+     * abstract) acts as a horizontal band boundary — column groups below
+     * it come after it, and within one band the left column is read
+     * before the right column.
+     */
+    private fun orderGroups(
+        fullGroups: List<List<TextLine>>,
+        columnGroups: List<List<List<TextLine>>>
+    ): List<List<TextLine>> {
+        if (fullGroups.isEmpty()) return columnGroups.flatten()
+        if (columnGroups.all { it.isEmpty() }) return fullGroups
+        fun topOf(g: List<TextLine>) = g.minOf { it.relY }
+        fun bottomOf(g: List<TextLine>) = g.maxOf { it.relY + it.relHeight }
+        fun leftOf(g: List<TextLine>) = g.minOf { it.relX }
+        data class Entry(
+            val group: List<TextLine>,
+            val band: Int,
+            val kind: Int,
+            val col: Int,
+            val top: Float,
+            val left: Float
+        )
         val entries = mutableListOf<Entry>()
-        fullBlocks.forEachIndexed { i, b -> entries += Entry(b, i, 0, 0) }
-        columnBlocks.forEachIndexed { col, blocks ->
-            for (b in blocks) {
-                val band = fullBlocks.count { f -> f.relY + f.relHeight <= b.relY + 0.001f }
-                entries += Entry(b, band, 1, col)
+        fullGroups.forEachIndexed { i, g -> entries += Entry(g, i, 0, 0, topOf(g), leftOf(g)) }
+        columnGroups.forEachIndexed { col, groups ->
+            for (g in groups) {
+                val band = fullGroups.count { f -> bottomOf(f) <= topOf(g) + 0.001f }
+                entries += Entry(g, band, 1, col, topOf(g), leftOf(g))
             }
         }
         return entries
-            .sortedWith(compareBy({ it.band }, { it.kind }, { it.col }, { it.block.relY }, { it.block.relX }))
-            .map { it.block }
+            .sortedWith(compareBy({ it.band }, { it.kind }, { it.col }, { it.top }, { it.left }))
+            .map { it.group }
     }
 
     private data class ColumnSplit(
@@ -231,32 +351,64 @@ object PdfBlockExtractor {
         return if (cjk) a + b else "$a $b"
     }
 
-    private fun clusterColumn(lines: List<TextLine>): List<TextBlock> {
+    /**
+     * Groups one sorted run of lines (one column, or the full-width band)
+     * into consecutive clusters. Because the clusters are consecutive runs
+     * of the input, they form an exact partition of it by construction.
+     */
+    private fun clusterGroup(lines: List<TextLine>, bodyHeight: Float): List<List<TextLine>> {
         if (lines.isEmpty()) return emptyList()
-        val blocks = mutableListOf<TextBlock>()
+        val groups = mutableListOf<List<TextLine>>()
         var current = mutableListOf<TextLine>()
 
         fun flush() {
-            if (current.isEmpty()) return
-            blocks += makeBlock(current, blocks.size)
-            current = mutableListOf()
+            if (current.isNotEmpty()) {
+                groups += current.toList()
+                current = mutableListOf()
+            }
         }
 
         for (line in lines) {
-            val prev = current.lastOrNull()
-            if (prev != null) {
-                val gap = line.relY - (prev.relY + prev.relHeight)
-                val largeGap = gap > prev.relHeight * 1.1f
-                val heightRatio = line.relHeight / prev.relHeight.coerceAtLeast(0.001f)
-                val heightJump = heightRatio > 1.35f || heightRatio < 0.74f
-                val overlap = horizontalOverlap(prev, line)
-                val disjoint = overlap < 0.12f
-                if (largeGap || heightJump || disjoint) flush()
+            if (isBylineLine(line.text)) {
+                flush()
+                groups += listOf(line)
+                continue
             }
+            val prev = current.lastOrNull()
+            if (prev != null && shouldSplit(current, prev, line, bodyHeight)) flush()
             current.add(line)
         }
         flush()
-        return blocks
+        return groups
+    }
+
+    private fun shouldSplit(
+        current: List<TextLine>,
+        prev: TextLine,
+        line: TextLine,
+        bodyHeight: Float
+    ): Boolean {
+        val gap = line.relY - (prev.relY + prev.relHeight)
+        // A line whose size differs sharply from the running cluster (or
+        // from its immediate neighbour) starts a new block — this is what
+        // keeps headings, captions, and bylines out of body paragraphs.
+        val ratioCluster = line.relHeight / medianHeight(current).coerceAtLeast(0.001f)
+        val ratioPrev = line.relHeight / prev.relHeight.coerceAtLeast(0.001f)
+        val heightJump = ratioCluster > 1.35f || ratioCluster < 0.74f ||
+            ratioPrev > 1.35f || ratioPrev < 0.74f
+        if (heightJump) {
+            // Title-band exception: consecutive display-size lines are one
+            // heading even when their sizes differ enough to trip the jump
+            // rule (a two-size title), provided they sit close together.
+            val bothLarge = bodyHeight > 0f &&
+                prev.relHeight >= bodyHeight * TITLE_BAND_MIN_RATIO &&
+                line.relHeight >= bodyHeight * TITLE_BAND_MIN_RATIO
+            val bandGapLimit = 0.6f * (prev.relHeight + line.relHeight) / 2f
+            if (!(bothLarge && gap < bandGapLimit)) return true
+        }
+        if (gap > prev.relHeight * 1.1f) return true
+        if (horizontalOverlap(prev, line) < 0.12f) return true
+        return false
     }
 
     private fun horizontalOverlap(a: TextLine, b: TextLine): Float {
