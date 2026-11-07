@@ -151,7 +151,7 @@ private class ImageRectCollector(page: PDPage) : PDFGraphicsStreamEngine(page) {
     override fun shadingFill(shadingName: COSName) = Unit
 }
 
-private data class ExtractedWord(
+internal data class ExtractedWord(
     val text: String,
     val relX: Float,
     val relY: Float,
@@ -276,6 +276,42 @@ object PdfTextExtractor {
     }
 
     /**
+     * Segments one extractor line on large horizontal gaps (a title spanning
+     * the page next to a standfirst in another column, side-by-side figure
+     * labels). The gap must be comparable to a column gutter: with the old
+     * threshold (1.2x the glyph height) large display type and justified
+     * text were split at ordinary word spaces, shattering titles and
+     * abstracts into word-group fragments that translated separately and
+     * broke the overlay layout. 2x glyph height (and at least 4% of the
+     * page width) keeps word spacing intact while real column gutters
+     * still split.
+     */
+    internal fun segmentWordsByHorizontalGap(words: List<ExtractedWord>): List<List<ExtractedWord>> {
+        if (words.isEmpty()) return emptyList()
+        val sorted = words.sortedBy { it.relX }
+        val segments = mutableListOf<MutableList<ExtractedWord>>()
+        var current = mutableListOf<ExtractedWord>()
+        for (w in sorted) {
+            if (current.isEmpty()) {
+                current.add(w)
+                continue
+            }
+            val prev = current.last()
+            val gap = w.relX - (prev.relX + prev.relWidth)
+            val maxH = max(prev.relHeight, w.relHeight)
+            val gapThreshold = max(0.04f, maxH * 2.0f)
+            if (gap >= gapThreshold) {
+                segments.add(current)
+                current = mutableListOf(w)
+            } else {
+                current.add(w)
+            }
+        }
+        if (current.isNotEmpty()) segments.add(current)
+        return segments
+    }
+
+    /**
      * Extracts text and exact word bounding boxes natively from an already opened PDDocument instance.
      */
     fun extractNativeTextFromDoc(doc: PDDocument, pageIndex: Int): PageText? {
@@ -384,32 +420,7 @@ object PdfTextExtractor {
 
                     if (rawWords.isEmpty()) return
 
-                    // Sort words left-to-right
-                    val sortedRaw = rawWords.sortedBy { it.relX }
-
-                    // Segment line on large horizontal gaps (e.g. column gutters between title & standfirst)
-                    val segments = mutableListOf<MutableList<ExtractedWord>>()
-                    var currentSegment = mutableListOf<ExtractedWord>()
-
-                    for (w in sortedRaw) {
-                        if (currentSegment.isEmpty()) {
-                            currentSegment.add(w)
-                        } else {
-                            val prev = currentSegment.last()
-                            val gap = w.relX - (prev.relX + prev.relWidth)
-                            val maxH = max(prev.relHeight, w.relHeight)
-                            val gapThreshold = max(0.025f, maxH * 1.2f)
-                            if (gap >= gapThreshold) {
-                                segments.add(currentSegment)
-                                currentSegment = mutableListOf(w)
-                            } else {
-                                currentSegment.add(w)
-                            }
-                        }
-                    }
-                    if (currentSegment.isNotEmpty()) {
-                        segments.add(currentSegment)
-                    }
+                    val segments = segmentWordsByHorizontalGap(rawWords)
 
                     for (seg in segments) {
                         val segWords = seg.map { ew ->

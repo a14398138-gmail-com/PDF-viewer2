@@ -15,7 +15,6 @@ import com.example.pdf.PdfTextCache
 import com.example.pdf.PdfTextExtractor
 import com.example.pdf.SearchMatch
 import com.example.pdf.TranslatedBlock
-import com.example.pdf.TranslationBatch
 import com.example.translate.TranslateController
 import com.example.ui.theme.ThemeMode
 import com.example.util.LastShareAppManager
@@ -696,10 +695,12 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
             // in progress before the first block lands.
             publish()
 
-            // Group consecutive uncached blocks (same direction, joined
-            // length within the batch cap) so several blocks share one
-            // model invocation instead of paying a full prompt prefill
-            // per block. Cached blocks publish immediately and break a run.
+            // Translate one block per request. The v1.2.4 multi-block
+            // batching (@@@-separated) was removed: the model does not
+            // reliably echo the separator positions, so translations shifted
+            // across block boundaries and were painted at the wrong
+            // rectangles (caption text showed up in body blocks and vice
+            // versa). Cached blocks publish immediately and break a run.
             var i = 0
             while (i < blocks.size) {
                 if (!_isTranslateMode.value) break
@@ -720,44 +721,12 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                     segEnd++
                 }
                 val segment = blocks.subList(i, segEnd)
-                val batches = TranslationBatch.planBatches(
-                    segment.map { it.text },
-                    segment.map { TranslateController.detectLang(it.text) }
-                )
-                for (batch in batches) {
+                for (b in segment) {
                     if (!_isTranslateMode.value) break
-                    val run = batch.map { segment[it] }
-                    val src = TranslateController.detectLang(run.first().text)
+                    val src = TranslateController.detectLang(b.text)
                     val tgt = if (src == "ja") "en" else "ja"
-                    if (run.size == 1) {
-                        val t = translateBlockChunks(run.first().text, src, tgt)
-                        if (t == null) failed = true else accept(run.first(), t)
-                    } else {
-                        val joined = TranslationBatch.join(run.map { it.text })
-                        when (val r = translateStreamWithRetry(joined, src, tgt)) {
-                            is TranslateController.TranslateResult.Ok -> {
-                                val parts = TranslationBatch.split(r.text, run.size)
-                                if (parts != null) {
-                                    run.forEachIndexed { idx, b -> accept(b, parts[idx]) }
-                                } else {
-                                    // Separator not preserved: fall back to
-                                    // one request per block for this batch.
-                                    for (b in run) {
-                                        if (!_isTranslateMode.value) break
-                                        val t = translateBlockChunks(b.text, src, tgt)
-                                        if (t == null) failed = true else accept(b, t)
-                                    }
-                                }
-                            }
-                            is TranslateController.TranslateResult.Error -> {
-                                android.util.Log.w(
-                                    "PdfViewerViewModel",
-                                    "Batch translation failed (page $pageIdx): ${r.message}"
-                                )
-                                failed = true
-                            }
-                        }
-                    }
+                    val t = translateBlockChunks(b.text, src, tgt)
+                    if (t == null) failed = true else accept(b, t)
                     publish()
                     if (failed) break
                 }

@@ -27,6 +27,57 @@ class PdfTextExtractorTest {
         words = words
     )
 
+    // ---- segmentWordsByHorizontalGap() ------------------------------------
+
+    private fun ew(text: String, x: Float, w: Float, h: Float = 0.02f) = ExtractedWord(
+        text = text, relX = x, relY = 0.1f, relWidth = w, relHeight = h
+    )
+
+    @Test
+    fun segmentKeepsTitleWordSpacingTogether() {
+        // Large display type (h = 0.03): word gaps of ~0.015 must NOT split the
+        // title into fragments (the old 1.2x-height threshold did).
+        val words = listOf(
+            ew("Rapid", 0.08f, 0.05f, h = 0.03f),
+            ew("blue-light-mediated", 0.145f, 0.16f, h = 0.03f),
+            ew("induction", 0.32f, 0.07f, h = 0.03f),
+            ew("of", 0.405f, 0.015f, h = 0.03f),
+            ew("protein", 0.435f, 0.055f, h = 0.03f)
+        )
+        val segments = PdfTextExtractor.segmentWordsByHorizontalGap(words)
+        assertEquals(1, segments.size)
+    }
+
+    @Test
+    fun segmentSplitsColumnGutterInOneLine() {
+        // A title line and a standfirst line extracted in one writeString:
+        // the gutter gap (~0.1) splits them apart.
+        val words = listOf(
+            ew("Rapid", 0.08f, 0.05f),
+            ew("induction", 0.15f, 0.07f),
+            ew("Reversible", 0.56f, 0.06f),
+            ew("interactions", 0.64f, 0.08f)
+        )
+        val segments = PdfTextExtractor.segmentWordsByHorizontalGap(words)
+        assertEquals(2, segments.size)
+        assertEquals(listOf("Rapid", "induction"), segments[0].map { it.text })
+        assertEquals(listOf("Reversible", "interactions"), segments[1].map { it.text })
+    }
+
+    @Test
+    fun segmentKeepsJustifiedBodyWordSpacingTogether() {
+        // Body size (h = 0.02): sentence-width gaps stay in one segment.
+        val words = listOf(
+            ew("Dimerizers", 0.1f, 0.06f),
+            ew("allowing", 0.17f, 0.05f),
+            ew("inducible", 0.23f, 0.05f),
+            ew("control", 0.29f, 0.04f),
+            ew("of", 0.34f, 0.012f),
+            ew("interactions.", 0.36f, 0.08f)
+        )
+        assertEquals(1, PdfTextExtractor.segmentWordsByHorizontalGap(words).size)
+    }
+
     // ---- search() -----------------------------------------------------------
 
     @Test

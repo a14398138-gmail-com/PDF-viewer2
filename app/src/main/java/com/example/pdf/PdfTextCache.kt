@@ -22,8 +22,10 @@ object PdfTextCache {
     /**
      * Version of the page-cache payload. v3 adds horizontal gap splitting
      * for multi-column layouts and natural word spacing reconstruction.
+     * v4 tightens the gap-split threshold (2x glyph height) so titles and
+     * justified text no longer shatter into word-group segments.
      */
-    private const val PAGE_SCHEMA_VERSION = 3
+    private const val PAGE_SCHEMA_VERSION = 4
 
     fun keyFor(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
