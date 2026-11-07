@@ -15,6 +15,7 @@ import com.example.pdf.PdfTextCache
 import com.example.pdf.PdfTextExtractor
 import com.example.pdf.SearchMatch
 import com.example.pdf.TranslatedBlock
+import com.example.pdf.TranslationBatch
 import com.example.translate.TranslateController
 import com.example.ui.theme.ThemeMode
 import com.example.util.LastShareAppManager
@@ -545,7 +546,13 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    /** Queues translation for the focus page and its neighbours (never all pages). */
+    /**
+     * Queues translation for the focus page and its neighbours (never all
+     * pages). The translation engine is a single serialized resource, so
+     * neighbours only start once the focus page's job has finished —
+     * otherwise the page the user is looking at progresses at a fraction
+     * of the engine's speed while it is shared with up to four others.
+     */
     fun schedulePageTranslations(focusPage: Int) {
         if (!_isTranslateMode.value) return
         val pageCount = currentItemPageCount()
@@ -553,10 +560,20 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
         val order = listOf(focusPage, focusPage + 1, focusPage - 1, focusPage + 2, focusPage - 2)
             .filter { it in 0 until pageCount }
             .distinct()
-        for (page in order) {
-            if (page in claimedTranslationPages) continue
-            viewModelScope.launch(Dispatchers.Default) {
-                translatePageInternal(page)
+        val focus = order.firstOrNull() ?: return
+        val focusJob = viewModelScope.launch(Dispatchers.Default) {
+            translatePageInternal(focus)
+        }
+        val neighbours = order.drop(1)
+        if (neighbours.isNotEmpty()) {
+            viewModelScope.launch {
+                focusJob.join()
+                for (page in neighbours) {
+                    if (page in claimedTranslationPages) continue
+                    viewModelScope.launch(Dispatchers.Default) {
+                        translatePageInternal(page)
+                    }
+                }
             }
         }
     }
@@ -564,10 +581,33 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
     private fun isTranslatableText(text: String): Boolean =
         text.any { it.isLetter() } && text.trim().length >= 3 && !PdfBlockExtractor.isBylineBlock(text)
 
+    /** Translates one block through the sentence-chunk path; null on failure. */
+    private suspend fun translateBlockChunks(blockText: String, src: String, tgt: String): String? {
+        val separator = if (tgt == "ja") "" else " "
+        val translated = StringBuilder()
+        for (chunk in PdfBlockExtractor.splitIntoChunks(blockText)) {
+            when (val r = translateController.translateStream(chunk, src, tgt) {}) {
+                is TranslateController.TranslateResult.Ok -> {
+                    if (translated.isNotEmpty()) translated.append(separator)
+                    translated.append(r.text)
+                }
+                is TranslateController.TranslateResult.Error -> {
+                    android.util.Log.w("PdfViewerViewModel", "Block translation failed: ${r.message}")
+                    return null
+                }
+            }
+        }
+        return translated.toString().trim().ifEmpty { null }
+    }
+
     private suspend fun translatePageInternal(pageIdx: Int) {
         if (!claimedTranslationPages.add(pageIdx)) return
         _translatingPages.value = _translatingPages.value + pageIdx
         var completed = false
+        // Translations finished on this page, flushed to the cache in one
+        // batch write when the page ends (or is interrupted).
+        val pendingSaves = linkedMapOf<Int, Pair<String, String>>()
+        var cacheKey: String? = null
         try {
             val pageText = _activePagesText.value.getOrNull(pageIdx) ?: return
             // Native text layer only: OCR pages are out of scope by design.
@@ -576,7 +616,7 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                 .filter { isTranslatableText(it.text) }
             if (blocks.isEmpty()) return
 
-            val cacheKey = currentCacheKey
+            cacheKey = currentCacheKey
             val cached = if (cacheKey != null) {
                 withContext(Dispatchers.IO) {
                     PdfTextCache.loadTranslations(getApplication(), cacheKey, pageIdx)
@@ -587,57 +627,101 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
 
             val results = mutableListOf<TranslatedBlock>()
             var failed = false
-            for (block in blocks) {
+
+            fun publish() {
+                if (results.isNotEmpty()) {
+                    _pageTranslations.value = _pageTranslations.value + (pageIdx to results.toList())
+                }
+            }
+
+            fun accept(block: com.example.pdf.TextBlock, translatedText: String) {
+                results.add(TranslatedBlock(block, translatedText))
+                pendingSaves[block.blockIndex] = block.text to translatedText
+            }
+
+            // Group consecutive uncached blocks (same direction, joined
+            // length within the batch cap) so several blocks share one
+            // model invocation instead of paying a full prompt prefill
+            // per block. Cached blocks publish immediately and break a run.
+            var i = 0
+            while (i < blocks.size) {
                 if (!_isTranslateMode.value) break
-                val hit = cached[block.blockIndex]
-                if (hit != null && hit.first == block.text) {
-                    results.add(TranslatedBlock(block, hit.second))
+                val first = blocks[i]
+                val hit = cached[first.blockIndex]
+                if (hit != null && hit.first == first.text) {
+                    results.add(TranslatedBlock(first, hit.second))
+                    publish()
+                    i++
                     continue
                 }
-                val src = TranslateController.detectLang(block.text)
-                val tgt = if (src == "ja") "en" else "ja"
-                val separator = if (tgt == "ja") "" else " "
-                val translated = StringBuilder()
-                var blockFailed = false
-                for (chunk in PdfBlockExtractor.splitIntoChunks(block.text)) {
-                    when (val r = translateController.translateStream(chunk, src, tgt) {}) {
-                        is TranslateController.TranslateResult.Ok -> {
-                            if (translated.isNotEmpty()) translated.append(separator)
-                            translated.append(r.text)
-                        }
-                        is TranslateController.TranslateResult.Error -> {
-                            android.util.Log.w("PdfViewerViewModel", "Block translation failed (page $pageIdx): ${r.message}")
-                            blockFailed = true
-                            failed = true
-                            break
+                // Maximal run of consecutive uncached blocks starting at i.
+                var segEnd = i
+                while (segEnd < blocks.size) {
+                    val b = blocks[segEnd]
+                    val h = cached[b.blockIndex]
+                    if (h != null && h.first == b.text) break
+                    segEnd++
+                }
+                val segment = blocks.subList(i, segEnd)
+                val batches = TranslationBatch.planBatches(
+                    segment.map { it.text },
+                    segment.map { TranslateController.detectLang(it.text) }
+                )
+                for (batch in batches) {
+                    if (!_isTranslateMode.value) break
+                    val run = batch.map { segment[it] }
+                    val src = TranslateController.detectLang(run.first().text)
+                    val tgt = if (src == "ja") "en" else "ja"
+                    if (run.size == 1) {
+                        val t = translateBlockChunks(run.first().text, src, tgt)
+                        if (t == null) failed = true else accept(run.first(), t)
+                    } else {
+                        val joined = TranslationBatch.join(run.map { it.text })
+                        when (val r = translateController.translateStream(joined, src, tgt) {}) {
+                            is TranslateController.TranslateResult.Ok -> {
+                                val parts = TranslationBatch.split(r.text, run.size)
+                                if (parts != null) {
+                                    run.forEachIndexed { idx, b -> accept(b, parts[idx]) }
+                                } else {
+                                    // Separator not preserved: fall back to
+                                    // one request per block for this batch.
+                                    for (b in run) {
+                                        if (!_isTranslateMode.value) break
+                                        val t = translateBlockChunks(b.text, src, tgt)
+                                        if (t == null) failed = true else accept(b, t)
+                                    }
+                                }
+                            }
+                            is TranslateController.TranslateResult.Error -> {
+                                android.util.Log.w(
+                                    "PdfViewerViewModel",
+                                    "Batch translation failed (page $pageIdx): ${r.message}"
+                                )
+                                failed = true
+                            }
                         }
                     }
+                    publish()
                 }
-                if (blockFailed) continue
-                val translatedText = translated.toString().trim()
-                if (translatedText.isNotEmpty()) {
-                    results.add(TranslatedBlock(block, translatedText))
-                    if (cacheKey != null) {
-                        withContext(Dispatchers.IO) {
-                            PdfTextCache.saveTranslation(
-                                getApplication(), cacheKey, pageIdx,
-                                block.blockIndex, block.text, translatedText
-                            )
-                        }
-                    }
-                }
-                // Publish progressively so the page fills in block by block.
-                _pageTranslations.value = _pageTranslations.value + (pageIdx to results.toList())
+                i = segEnd
             }
             completed = !failed && results.isNotEmpty()
-            if (results.isNotEmpty()) {
-                _pageTranslations.value = _pageTranslations.value + (pageIdx to results.toList())
-            }
+            publish()
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
             android.util.Log.w("PdfViewerViewModel", "Page translation failed (page $pageIdx): ${e.message}")
         } finally {
+            val key = cacheKey
+            if (key != null && pendingSaves.isNotEmpty()) {
+                try {
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                        PdfTextCache.saveTranslations(getApplication(), key, pageIdx, pendingSaves)
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w("PdfViewerViewModel", "Cache flush failed (page $pageIdx): ${e.message}")
+                }
+            }
             _translatingPages.value = _translatingPages.value - pageIdx
             if (!completed) {
                 // Allow a later visit to retry unfinished pages.

@@ -683,12 +683,7 @@ object PdfTextExtractor {
 
                 // 行またぎであっても改行を挿入せず、自然な文章として連結
                 if (prev.text.endsWith("-") && !isPrevCjk && !isCurCjk) {
-                    if (!prev.text.dropLast(1).contains('-')) {
-                        // 単語末尾のハイフンによる行またぎ（例: "inter-" + "national" -> "international"）を結合
-                        sb.setLength(sb.length - 1)
-                    } else {
-                        // 複合語ハイフン（例: "blue-light-" + "mediated" -> "blue-light-mediated"）はハイフンを維持
-                    }
+                    // 単語末尾のハイフン（例: "blue-light-" + "mediated" -> "blue-light-mediated"）は空白を挟まず連結
                 } else if (!isPrevCjk && !isCurCjk) {
                     // 英数字・欧文単語間のスペース
                     sb.append(" ")
@@ -724,9 +719,7 @@ object PdfTextExtractor {
                     val isCurCjk = curFirst != null && isCjkChar(curFirst)
 
                     if (prev.endsWith("-") && !isPrevCjk && !isCurCjk) {
-                        if (!prev.dropLast(1).contains('-')) {
-                            sb.setLength(sb.length - 1)
-                        }
+                        sb.setLength(sb.length - 1)
                     } else if (!isPrevCjk && !isCurCjk) {
                         sb.append(" ")
                     }
@@ -816,9 +809,7 @@ object PdfTextExtractor {
                 val isPrevCjk = prevLast != null && isCjkChar(prevLast)
                 val isCurCjk = curFirst != null && isCjkChar(curFirst)
                 if (prev.text.endsWith("-") && !isPrevCjk && !isCurCjk) {
-                    if (!prev.text.dropLast(1).contains('-')) {
-                        sb.setLength(sb.length - 1)
-                    }
+                    // 単語末尾のハイフンは空白を挟まず連結（joinWordsと同一規則）
                 } else if (!isPrevCjk && !isCurCjk) {
                     sb.append(" ")
                 }

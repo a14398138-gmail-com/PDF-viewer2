@@ -192,6 +192,54 @@ object PdfTextCache {
         }
     }
 
+    /**
+     * Batch variant of [saveTranslation]: persists every entry of
+     * [entries] (blockIndex -> (source, translation)) with a single
+     * read-modify-write of the page's translation file, instead of one
+     * full-file rewrite per block.
+     */
+    @Synchronized
+    fun saveTranslations(
+        context: Context,
+        key: String,
+        pageIndex: Int,
+        entries: Map<Int, Pair<String, String>>
+    ) {
+        val usable = entries.filterValues { it.second.isNotBlank() }
+        if (usable.isEmpty()) return
+        try {
+            val file = translationFile(context, key, pageIndex)
+            file.parentFile?.mkdirs()
+            var json = if (file.exists() && file.length() > 0L) {
+                try { JSONObject(file.readText()) } catch (_: Exception) { JSONObject() }
+            } else {
+                JSONObject()
+            }
+            if (json.optInt("schema", 1) != PdfBlockExtractor.LAYOUT_SCHEMA_VERSION) {
+                // Stale-schema entries must not linger next to new ones.
+                json = JSONObject()
+            }
+            json.put("schema", PdfBlockExtractor.LAYOUT_SCHEMA_VERSION)
+            for ((blockIndex, pair) in usable) {
+                json.put(
+                    blockIndex.toString(),
+                    JSONObject().apply {
+                        put("src", pair.first)
+                        put("tgt", pair.second)
+                    }
+                )
+            }
+            val tmp = File(file.parentFile, file.name + ".tmp")
+            tmp.writeText(json.toString())
+            if (!tmp.renameTo(file)) {
+                tmp.copyTo(file, overwrite = true)
+                tmp.delete()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to cache translations for page $pageIndex: ${e.message}")
+        }
+    }
+
     fun savePage(context: Context, key: String, pageText: PageText) {
         // Empty results are not cached: they may be a transient OCR failure and
         // must be retried on the next open.
