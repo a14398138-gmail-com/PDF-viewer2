@@ -1020,9 +1020,17 @@ fun PdfPageItem(
                         typeface = android.graphics.Typeface.DEFAULT
                     }
                 }
+                val imageRects = pageText?.imageRects.orEmpty()
                 Canvas(modifier = Modifier.fillMaxSize()) {
                     val measurer = PaintTextMeasurer(overlayPaint)
                     renderBlocks.forEach { tb ->
+                        // A block whose rectangle mostly sits inside a placed
+                        // image is figure content that slipped through the
+                        // extraction filter: painting it would erase and
+                        // overwrite the figure panels, so it is skipped.
+                        if (imageRects.any {
+                                com.example.pdf.PdfBlockExtractor.blockImageCoverRatio(tb.block, it) >= 0.5f
+                            }) return@forEach
                         drawTranslatedBlock(tb, overlayPaint, measurer, blockBg, blockFg)
                     }
                 }

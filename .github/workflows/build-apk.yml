@@ -35,9 +35,24 @@ jobs:
           gradle-version: '9.3.1'
 
       - name: Prepare environment
+        env:
+          DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
         run: |
           touch .env
-          if [ -f "debug.keystore.base64" ]; then
+          if [ -n "$DEBUG_KEYSTORE_BASE64" ]; then
+            # Secrets pasted via the GitHub UI often carry surrounding
+            # whitespace/newlines or a data-URI style prefix; strip them
+            # before decoding.
+            CLEAN=$(printf '%s' "$DEBUG_KEYSTORE_BASE64" | tr -d ' \t\r\n' | sed -e 's#^data:.*;base64,##' -e 's#^base64,##')
+            if printf '%s' "$CLEAN" | base64 -d > debug.keystore 2>/dev/null \
+               && [ -s debug.keystore ] \
+               && keytool -list -keystore debug.keystore -storepass android >/dev/null 2>&1; then
+              echo "Using keystore from DEBUG_KEYSTORE_BASE64."
+            else
+              echo "::error::DEBUG_KEYSTORE_BASE64 could not be decoded into a valid keystore (storepass android). Re-create it with: base64 -w0 debug.keystore"
+              exit 1
+            fi
+          elif [ -f "debug.keystore.base64" ]; then
             base64 -d debug.keystore.base64 > debug.keystore
           else
             keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
@@ -73,3 +88,33 @@ jobs:
           files: app/build/outputs/apk/debug/app-debug.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Send APK to Discord webhook
+        if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) || github.event_name == 'workflow_dispatch'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL is not set; skipping."
+            exit 0
+          fi
+          SIZE=$(stat -c%s "$APK")
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/latest/app-debug.apk"
+          # Discord webhooks accept attachments up to 8 MB; larger APKs are
+          # announced with the direct release link instead.
+          if [ "$SIZE" -le 8388608 ]; then
+            STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
+              -F "payload_json={\"content\":\"app-debug.apk (build #${{ github.run_number }}) / direct: ${RELEASE_URL}\"}" \
+              -F "files[0]=@${APK};type=application/vnd.android.package-archive" \
+              "$DISCORD_WEBHOOK_URL")
+          else
+            STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
+              -F "payload_json={\"content\":\"app-debug.apk (build #${{ github.run_number }}) is ${SIZE} bytes, above the Discord upload limit. Direct download: ${RELEASE_URL}\"}" \
+              "$DISCORD_WEBHOOK_URL")
+          fi
+          echo "Discord webhook responded: ${STATUS}"
+          if [ "$STATUS" != "200" ] && [ "$STATUS" != "204" ]; then
+            echo "Discord webhook delivery failed (HTTP ${STATUS})."
+            exit 1
+          fi

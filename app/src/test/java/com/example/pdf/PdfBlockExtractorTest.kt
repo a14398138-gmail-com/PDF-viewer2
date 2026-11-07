@@ -128,9 +128,61 @@ class PdfBlockExtractorTest {
         val a = TranslatedBlock(block(0, "Top", 0.1f, 0.1f, 0.4f, 0.03f), "上")
         val b = TranslatedBlock(block(1, "Bottom", 0.1f, 0.6f, 0.4f, 0.03f), "下")
         assertEquals(2, PdfBlockExtractor.mergeOverlappingBlocks(listOf(a, b)).size)
-        // Slightly touching rects (well below the 0.35 threshold) also stay apart.
+        // Slightly touching rects (well below the 0.75 threshold) also stay apart.
         val c = TranslatedBlock(block(2, "Next", 0.1f, 0.125f, 0.4f, 0.03f), "次")
         assertEquals(2, PdfBlockExtractor.mergeOverlappingBlocks(listOf(a, c)).size)
+    }
+
+    @Test
+    fun mergeOverlappingBlocksKeepsDistinctTouchingBlocksApart() {
+        // A byline rect slightly overlapping the title band above it (the
+        // large title glyphs extend past the byline's top edge). The union
+        // rectangle would span title + byline and smear the title's
+        // translation over the author line, so the blocks must stay apart.
+        fun block(idx: Int, text: String, x: Float, y: Float, w: Float, h: Float) = TextBlock(
+            blockIndex = idx, text = text, relX = x, relY = y,
+            relWidth = w, relHeight = h, lineCount = 1, avgLineHeight = h
+        )
+        val title = TranslatedBlock(block(0, "A Long Paper Title", 0.08f, 0.05f, 0.84f, 0.05f), "タイトル")
+        val byline = TranslatedBlock(block(1, "Matthew J Kennedy, Robert M Hughes", 0.08f, 0.092f, 0.84f, 0.014f), "著者ら")
+        val merged = PdfBlockExtractor.mergeOverlappingBlocks(listOf(title, byline))
+        assertEquals(2, merged.size)
+        assertEquals("タイトル", merged[0].translatedText)
+        assertEquals("著者ら", merged[1].translatedText)
+    }
+
+    @Test
+    fun multiWordSmallFigureFragmentsAreExcluded() {
+        val lines = listOf(
+            line(0, "Body text begins here with", 0.1f, 0.10f, 0.8f),
+            line(1, "a second line of the body", 0.1f, 0.125f, 0.8f),
+            line(2, "and a third body line.", 0.1f, 0.15f, 0.8f),
+            // Vector-figure annotations: small height, 4-5 words.
+            line(3, "488 nm (25 μW)", 0.7f, 0.50f, 0.15f, h = 0.011f),
+            line(4, "Scale bar, 5 μm.", 0.72f, 0.53f, 0.14f, h = 0.011f),
+            line(5, "Time after pulse (s)", 0.71f, 0.56f, 0.16f, h = 0.011f)
+        )
+        val blocks = PdfBlockExtractor.blocksFromPageText(page(lines))
+        assertEquals(1, blocks.size)
+        assertTrue(blocks.none { it.text.contains("488") || it.text.contains("Scale") })
+    }
+
+    @Test
+    fun blockImageCoverRatioDetectsBlocksInsideFigures() {
+        fun block(x: Float, y: Float, w: Float, h: Float) = TextBlock(
+            blockIndex = 0, text = "text", relX = x, relY = y,
+            relWidth = w, relHeight = h, lineCount = 1, avgLineHeight = h
+        )
+        val image = RelRect(0.1f, 0.45f, 0.5f, 0.2f)
+        // A caption block sitting just under the image: barely covered.
+        val caption = block(0.1f, 0.66f, 0.5f, 0.03f)
+        assertTrue(PdfBlockExtractor.blockImageCoverRatio(caption, image) < 0.5f)
+        // A block laid out across the figure panels: mostly covered.
+        val inFigure = block(0.15f, 0.50f, 0.4f, 0.10f)
+        assertTrue(PdfBlockExtractor.blockImageCoverRatio(inFigure, image) >= 0.5f)
+        // Disjoint blocks are never covered.
+        val body = block(0.1f, 0.10f, 0.5f, 0.03f)
+        assertEquals(0f, PdfBlockExtractor.blockImageCoverRatio(body, image))
     }
 
     @Test

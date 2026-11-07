@@ -62,18 +62,25 @@ object PdfBlockExtractor {
      * change to how lines are grouped must bump this — [PdfTextCache]
      * invalidates older translation caches on a mismatch.
      * v3: multi-line byline grouping, figure caption splitting, robust band ordering.
+     * v4: multi-word small figure fragments excluded (vector-figure axis
+     * labels and scale-bar annotations were translated and painted over
+     * the figure panels).
      */
-    const val LAYOUT_SCHEMA_VERSION = 3
+    const val LAYOUT_SCHEMA_VERSION = 4
 
     /** A line counts as figure text when at least this share of it lies
      *  inside a placed image. */
     private const val IMAGE_OVERLAP_THRESHOLD = 0.20f
 
     /** Fallback figure-label test: a line shorter (in height) than this
-     *  share of the body size with at most [FIGURE_FRAGMENT_MAX_WORDS]
-     *  words is treated as an axis tick / panel label fragment. */
+     *  share of the body size, narrower than [FIGURE_FRAGMENT_MAX_WIDTH]
+     *  of the page, with at most [FIGURE_FRAGMENT_MAX_WORDS] words is
+     *  treated as an axis tick / panel label fragment. The width bound is
+     *  what keeps small real text (footnotes, standfirsts, last lines of
+     *  paragraphs) out of the fragment rule. */
     private const val FIGURE_FRAGMENT_HEIGHT_RATIO = 0.8f
-    private const val FIGURE_FRAGMENT_MAX_WORDS = 3
+    private const val FIGURE_FRAGMENT_MAX_WIDTH = 0.25f
+    private const val FIGURE_FRAGMENT_MAX_WORDS = 5
 
     /** Lines at least this much larger than the body size are display
      *  type; consecutive ones form a single title/heading band. */
@@ -139,6 +146,7 @@ object PdfBlockExtractor {
         }
         if (bodyHeight <= 0f) return false
         if (line.relHeight >= bodyHeight * FIGURE_FRAGMENT_HEIGHT_RATIO) return false
+        if (line.relWidth > FIGURE_FRAGMENT_MAX_WIDTH) return false
         val wordCount = line.text.trim().split(WHITESPACE).count { it.isNotEmpty() }
         return wordCount <= FIGURE_FRAGMENT_MAX_WORDS
     }
@@ -311,15 +319,21 @@ object PdfBlockExtractor {
     }
 
     /**
-     * Merges translated blocks whose rectangles overlap heavily (intersection
-     * covers at least [overlapThreshold] of the smaller block). Overlapping
-     * blocks are painted twice over the same glyphs and produce the garbled
-     * double-drawn areas seen around titles; merging keeps one rectangle and
-     * the concatenated text in reading order instead.
+     * Merges translated blocks whose rectangles are near-duplicates
+     * (intersection covers at least [overlapThreshold] of the smaller block).
+     * Truly overlapping blocks are painted twice over the same glyphs and
+     * produce the garbled double-drawn areas seen around titles; merging
+     * keeps one rectangle and the concatenated text in reading order instead.
+     * Distinct blocks that merely touch — a byline under a title band, a
+     * caption under a figure — must NOT merge: their union rectangle would
+     * erase and redraw a region far larger than either block, smearing the
+     * translation of one block across the other's source glyphs. That is
+     * why the default threshold is high (0.75): only blocks covering almost
+     * the same area merge.
      */
     fun mergeOverlappingBlocks(
         blocks: List<TranslatedBlock>,
-        overlapThreshold: Float = 0.35f
+        overlapThreshold: Float = 0.75f
     ): List<TranslatedBlock> {
         if (blocks.size < 2) return blocks
         val work = blocks.toMutableList()
@@ -338,6 +352,18 @@ object PdfBlockExtractor {
             }
         }
         return work
+    }
+
+    /** Intersection area of [block] and [image], divided by the block's area. */
+    fun blockImageCoverRatio(block: TextBlock, image: RelRect): Float {
+        val iw = min(block.relX + block.relWidth, image.relX + image.relWidth) -
+            max(block.relX, image.relX)
+        val ih = min(block.relY + block.relHeight, image.relY + image.relHeight) -
+            max(block.relY, image.relY)
+        if (iw <= 0f || ih <= 0f) return 0f
+        val area = block.relWidth * block.relHeight
+        if (area <= 0f) return 0f
+        return (iw * ih) / area
     }
 
     /** Intersection area divided by the smaller block's area (0 = disjoint). */
