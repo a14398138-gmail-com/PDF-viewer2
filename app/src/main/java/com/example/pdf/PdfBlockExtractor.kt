@@ -73,9 +73,13 @@ object PdfBlockExtractor {
     private const val IMAGE_OVERLAP_THRESHOLD = 0.20f
 
     /** Fallback figure-label test: a line shorter (in height) than this
-     *  share of the body size with at most [FIGURE_FRAGMENT_MAX_WORDS]
-     *  words is treated as an axis tick / panel label fragment. */
+     *  share of the body size, narrower than [FIGURE_FRAGMENT_MAX_WIDTH]
+     *  of the page, with at most [FIGURE_FRAGMENT_MAX_WORDS] words is
+     *  treated as an axis tick / panel label fragment. The width bound is
+     *  what keeps small real text (footnotes, standfirsts, last lines of
+     *  paragraphs) out of the fragment rule. */
     private const val FIGURE_FRAGMENT_HEIGHT_RATIO = 0.8f
+    private const val FIGURE_FRAGMENT_MAX_WIDTH = 0.25f
     private const val FIGURE_FRAGMENT_MAX_WORDS = 5
 
     /** Lines at least this much larger than the body size are display
@@ -142,6 +146,7 @@ object PdfBlockExtractor {
         }
         if (bodyHeight <= 0f) return false
         if (line.relHeight >= bodyHeight * FIGURE_FRAGMENT_HEIGHT_RATIO) return false
+        if (line.relWidth > FIGURE_FRAGMENT_MAX_WIDTH) return false
         val wordCount = line.text.trim().split(WHITESPACE).count { it.isNotEmpty() }
         return wordCount <= FIGURE_FRAGMENT_MAX_WORDS
     }
