@@ -1,13 +1,13 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample backup rules file; uncomment and customize as necessary.
-   See https://developer.android.com/guide/topics/data/autobackup
-   for details.
-   Note: This file is ignored for devices older than API 31
-   See https://developer.android.com/about/versions/12/backup-restore
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Backup rules matched to what this app actually stores:
+  - files/saved_pdfs/ holds full copies of opened PDFs -> excluded (user content, large)
+  - files/thumbnails/ holds derived page thumbnails -> excluded (regenerable)
+  - cache/ holds decrypted plaintext PDFs (unlocked_*) and export temp files -> excluded
+  History database and shared preferences (notes, settings) are backed up as usual.
 -->
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+    <exclude domain="file" path="saved_pdfs/" />
+    <exclude domain="file" path="thumbnails/" />
+    <exclude domain="cache" path="." />
 </full-backup-content>

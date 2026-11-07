@@ -17,6 +17,7 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.CircularProgressIndicator
@@ -33,6 +34,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import com.example.ui.HomeScreen
 import com.example.ui.PdfViewerScreen
 import com.example.ui.PdfViewerViewModel
@@ -46,6 +49,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // Sweep decrypted plaintext PDFs left in the cache by a killed/crashed
+        // previous process (PdfEngine.close() normally deletes its own file).
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            com.example.pdf.PdfSecurity.cleanupStaleTempFiles(this@MainActivity)
+        }
 
         if (isPdfIntent(intent)) {
             viewModel.prepareIncomingIntent()
@@ -150,7 +159,13 @@ fun PdfApp(
     val currentMatchIndex by viewModel.currentMatchIndex.collectAsStateWithLifecycle()
     val isNoteDialogOpen by viewModel.isNoteDialogOpen.collectAsStateWithLifecycle()
     val isRenameDialogOpen by viewModel.isRenameDialogOpen.collectAsStateWithLifecycle()
-    val isTextSelectModalOpen by viewModel.isTextSelectModalOpen.collectAsStateWithLifecycle()
+    val extractionProgress by viewModel.extractionProgress.collectAsStateWithLifecycle()
+    val isTranslateMode by viewModel.isTranslateMode.collectAsStateWithLifecycle()
+    val pageTranslations by viewModel.pageTranslations.collectAsStateWithLifecycle()
+    val translatingPages by viewModel.translatingPages.collectAsStateWithLifecycle()
+    val showTranslateModelSetup by viewModel.showTranslateModelSetup.collectAsStateWithLifecycle()
+    val translateDownloadProgress by viewModel.translateDownloadProgress.collectAsStateWithLifecycle()
+    val isTranslateModelLoading by viewModel.isTranslateModelLoading.collectAsStateWithLifecycle()
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
     val errorMessage by viewModel.errorMessage.collectAsStateWithLifecycle()
     val recentSharedApps by viewModel.recentSharedApps.collectAsStateWithLifecycle()
@@ -160,6 +175,68 @@ fun PdfApp(
     val savePdfLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.CreateDocument("application/pdf")
     ) { uri -> uri?.let { viewModel.saveWithoutPassword(it) } }
+
+    val translateModelPickerLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
+    ) { uri -> uri?.let { viewModel.importTranslateModel(it) } }
+
+    if (showTranslateModelSetup) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { viewModel.dismissTranslateModelSetup() },
+            title = { androidx.compose.material3.Text("和訳モデルの準備") },
+            text = {
+                androidx.compose.foundation.layout.Column {
+                    androidx.compose.material3.Text(
+                        "論文和訳には翻訳モデル（PLaMo 3 Translate、約550MB）が必要です。" +
+                            "ダウンロードするか、既に端末にあるモデルファイルを選択してください。"
+                    )
+                    if (translateDownloadProgress != null) {
+                        androidx.compose.foundation.layout.Spacer(modifier = Modifier.size(12.dp))
+                        androidx.compose.material3.LinearProgressIndicator(
+                            progress = { translateDownloadProgress ?: 0f },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        androidx.compose.material3.Text(
+                            "ダウンロード中… ${((translateDownloadProgress ?: 0f) * 100).toInt()}%",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                androidx.compose.material3.TextButton(
+                    enabled = translateDownloadProgress == null,
+                    onClick = { viewModel.downloadTranslateModel() }
+                ) { androidx.compose.material3.Text("ダウンロード") }
+            },
+            dismissButton = {
+                androidx.compose.foundation.layout.Row {
+                    androidx.compose.material3.TextButton(
+                        enabled = translateDownloadProgress == null,
+                        onClick = { translateModelPickerLauncher.launch(arrayOf("*/*")) }
+                    ) { androidx.compose.material3.Text("ファイルを選択") }
+                    androidx.compose.material3.TextButton(
+                        onClick = { viewModel.dismissTranslateModelSetup() }
+                    ) { androidx.compose.material3.Text("キャンセル") }
+                }
+            }
+        )
+    }
+
+    if (isTranslateModelLoading) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = {},
+            title = { androidx.compose.material3.Text("翻訳モデルを読み込み中") },
+            text = {
+                androidx.compose.foundation.layout.Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                    androidx.compose.foundation.layout.Spacer(modifier = Modifier.size(12.dp))
+                    androidx.compose.material3.Text("初回はモデルの読み込みに少し時間がかかります。")
+                }
+            },
+            confirmButton = {}
+        )
+    }
 
     if (passwordRequired) {
         var password by androidx.compose.runtime.remember { mutableStateOf("") }
@@ -263,6 +340,11 @@ fun PdfApp(
                             onSearchQueryChanged = { viewModel.onSearchQueryChanged(it) },
                             onNextMatch = { viewModel.nextSearchMatch() },
                             onPrevMatch = { viewModel.prevSearchMatch() },
+                            extractionProgress = extractionProgress,
+                            isTranslateMode = isTranslateMode,
+                            onToggleTranslateMode = { viewModel.setTranslateMode(it) },
+                            pageTranslations = pageTranslations,
+                            translatingPages = translatingPages,
                             onPageTextRecognized = { pageIdx, text -> viewModel.updatePageText(pageIdx, text) },
                             onSaveWithoutPassword = {
                                 savePdfLauncher.launch(currentItem.fileName.substringBeforeLast('.', currentItem.fileName) + "_unlocked.pdf")

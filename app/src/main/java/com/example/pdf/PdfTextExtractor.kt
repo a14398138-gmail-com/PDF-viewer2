@@ -6,6 +6,8 @@ import android.graphics.Rect
 import android.util.Log
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
+import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
@@ -86,7 +88,19 @@ object PdfTextExtractor {
 
     var onOcrModelStatusListener: ((isPreparing: Boolean, message: String?) -> Unit)? = null
 
-    private val recognizer by lazy {
+    // Japanese recognizer (handles Japanese plus Latin characters) is primary:
+    // this app's documents are mostly Japanese lecture/paper material, and the
+    // previous Latin-only client made OCR of scanned Japanese PDFs unusable.
+    private val japaneseRecognizer: TextRecognizer by lazy {
+        try {
+            TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build())
+        } catch (e: Throwable) {
+            Log.w(TAG, "Japanese recognizer unavailable, falling back to Latin: ${e.message}")
+            TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        }
+    }
+
+    private val latinRecognizer: TextRecognizer by lazy {
         TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     }
 
@@ -107,14 +121,10 @@ object PdfTextExtractor {
     fun openSession(file: File): PdfTextExtractionSession {
         if (!file.exists()) return PdfTextExtractionSession(file, null)
         return try {
-            // Scratch-file loading keeps large PDFs from exhausting the heap
-            val doc = PDDocument.load(file, com.tom_roush.pdfbox.io.MemoryUsageSetting.setupTempFileOnly())
+            val doc = PDDocument.load(file)
             PdfTextExtractionSession(file, doc)
         } catch (e: Exception) {
             Log.w(TAG, "Failed to load PDDocument for session: ${e.message}")
-            PdfTextExtractionSession(file, null)
-        } catch (e: OutOfMemoryError) {
-            Log.w(TAG, "Out of memory loading PDDocument for session: ${e.message}")
             PdfTextExtractionSession(file, null)
         }
     }
@@ -279,49 +289,30 @@ object PdfTextExtractor {
     fun extractNativeTextFromPdf(file: File, pageIndex: Int): PageText? {
         if (!file.exists()) return null
         return try {
-            PDDocument.load(file, com.tom_roush.pdfbox.io.MemoryUsageSetting.setupTempFileOnly()).use { doc ->
+            PDDocument.load(file).use { doc ->
                 extractNativeTextFromDoc(doc, pageIndex)
             }
         } catch (e: Exception) {
             Log.w(TAG, "Native text extraction skipped or failed for page $pageIndex: ${e.message}")
             null
-        } catch (e: OutOfMemoryError) {
-            Log.w(TAG, "Out of memory during native text extraction for page $pageIndex: ${e.message}")
-            null
         }
-    }
-
-    /**
-     * Primary extraction method:
-     * 1. Uses embedded vector text layer if available (fast & 100% accurate)
-     * 2. Falls back to ML Kit OCR if the page has no native text (scanned / image)
-     */
-    suspend fun extractPageText(
-        file: File?,
-        bitmap: Bitmap?,
-        pageIndex: Int
-    ): PageText = withContext(Dispatchers.Default) {
-        // Step 1: Check native text layer
-        if (file != null && file.exists()) {
-            val nativeResult = extractNativeTextFromPdf(file, pageIndex)
-            if (nativeResult != null && nativeResult.words.isNotEmpty()) {
-                return@withContext nativeResult
-            }
-        }
-
-        // Step 2: Fall back to ML Kit OCR
-        if (bitmap != null) {
-            return@withContext extractPageFromBitmap(bitmap, pageIndex)
-        }
-
-        PageText(pageIndex = pageIndex, fullText = "", paragraphs = emptyList(), lines = emptyList(), words = emptyList())
     }
 
     suspend fun extractPageFromBitmap(bitmap: Bitmap, pageIndex: Int): PageText = withContext(Dispatchers.Default) {
         try {
             val image = InputImage.fromBitmap(bitmap, 0)
-            // Non-blocking coroutine await using kotlinx-coroutines-play-services
-            val result = recognizer.process(image).await()
+            // Non-blocking coroutine await using kotlinx-coroutines-play-services.
+            // Japanese model first; if it finds nothing, retry with the Latin model
+            // (covers purely Latin documents the Japanese model may miss).
+            var result = japaneseRecognizer.process(image).await()
+            if (result.text.isBlank()) {
+                try {
+                    val latinResult = latinRecognizer.process(image).await()
+                    if (latinResult.text.isNotBlank()) result = latinResult
+                } catch (e: Exception) {
+                    Log.w(TAG, "Latin OCR fallback failed on page $pageIndex: ${e.message}")
+                }
+            }
 
             val lines = mutableListOf<TextLine>()
             val allWords = mutableListOf<TextWord>()
@@ -446,17 +437,21 @@ object PdfTextExtractor {
                 isNativeTextLayer = false
             )
         } catch (e: Exception) {
+            // Only treat the failure as "model preparing" when the message actually
+            // says so. Almost every ML Kit failure is an MlKitException, so the old
+            // class-name check mislabelled genuine recognition failures as
+            // "preparing" forever.
             val msg = e.message ?: ""
             val isDownloading = msg.contains("download", ignoreCase = true) ||
                     msg.contains("waiting", ignoreCase = true) ||
-                    msg.contains("unavailable", ignoreCase = true) ||
-                    e.javaClass.name.contains("MlKitException", ignoreCase = true)
+                    msg.contains("module", ignoreCase = true) && msg.contains("unavailable", ignoreCase = true)
 
             if (isDownloading) {
                 Log.w(TAG, "ML Kit OCR model is preparing or downloading in background: ${e.message}", e)
                 onOcrModelStatusListener?.invoke(true, "OCRの準備中です")
             } else {
                 Log.e(TAG, "ML Kit recognition failed on page $pageIndex: ${e.message}", e)
+                onOcrModelStatusListener?.invoke(false, null)
             }
             PageText(
                 pageIndex = pageIndex,
@@ -575,5 +570,73 @@ object PdfTextExtractor {
             }
         }
         return matches
+    }
+
+    /**
+     * Ordinal (0-based) of [match] among all occurrences of [query] on its page,
+     * derived from the match's char offset into the page's full text.
+     */
+    fun occurrenceOrdinal(page: PageText, match: SearchMatch, query: String): Int {
+        val lowerQuery = query.lowercase().trim()
+        if (lowerQuery.isEmpty()) return 0
+        var count = 0
+        var idx = page.lowerText.indexOf(lowerQuery)
+        while (idx != -1 && idx < match.charOffset) {
+            count++
+            idx = page.lowerText.indexOf(lowerQuery, idx + 1)
+        }
+        return count
+    }
+
+    /**
+     * Maps a search hit to the indices of the words it spans, so the page view can
+     * highlight the hit in place. Words are re-joined with the same rules as
+     * [formatSelectedWords] (CJK characters without spaces, Latin words with a
+     * space) and the [occurrenceOrdinal]-th occurrence of the query in that
+     * joined text is selected. This is an approximation for OCR pages whose
+     * block layout differs from the word stream, but it is exact for the common
+     * single-line and CJK cases.
+     */
+    fun searchHighlightIndices(page: PageText, query: String, occurrenceOrdinal: Int): Set<Int> {
+        val lowerQuery = query.lowercase().trim()
+        if (lowerQuery.isEmpty() || page.words.isEmpty()) return emptySet()
+        val words = page.words.sortedBy { it.index }
+        val sb = StringBuilder()
+        val starts = IntArray(words.size)
+        val ends = IntArray(words.size)
+        for (i in words.indices) {
+            val cur = words[i]
+            if (i > 0) {
+                val prev = words[i - 1]
+                val prevLast = prev.text.lastOrNull()
+                val curFirst = cur.text.firstOrNull()
+                val isPrevCjk = prevLast != null && isCjkChar(prevLast)
+                val isCurCjk = curFirst != null && isCjkChar(curFirst)
+                if (prev.text.endsWith("-") && !isPrevCjk && !isCurCjk) {
+                    sb.setLength(sb.length - 1)
+                } else if (!isPrevCjk && !isCurCjk) {
+                    sb.append(" ")
+                }
+            }
+            starts[i] = sb.length
+            sb.append(cur.text)
+            ends[i] = sb.length
+        }
+        val joined = sb.toString().lowercase()
+        var idx = joined.indexOf(lowerQuery)
+        var ordinal = 0
+        while (idx != -1 && ordinal < occurrenceOrdinal) {
+            idx = joined.indexOf(lowerQuery, idx + 1)
+            ordinal++
+        }
+        if (idx == -1) return emptySet()
+        val hitEnd = idx + lowerQuery.length
+        val result = mutableSetOf<Int>()
+        for (i in words.indices) {
+            if (ends[i] > idx && starts[i] < hitEnd) {
+                result.add(words[i].index)
+            }
+        }
+        return result
     }
 }

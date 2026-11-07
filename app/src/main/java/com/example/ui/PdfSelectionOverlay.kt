@@ -74,19 +74,9 @@ fun PdfSelectionActionOverlay(
     clipboardManager: ClipboardManager,
     onDismissSelection: () -> Unit,
     onSetShareAppsDrawerVisible: (Boolean) -> Unit,
-    isControlsVisible: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-
-    // The bottom toolbar (58.dp tall + 16.dp bottom padding, also bottom-centered)
-    // occupies the same band this bar used to sit in (bottom 28.dp + 48.dp tall),
-    // so whenever the controls were visible the two overlapped. Lift the bar
-    // above the toolbar while it is shown; drop it back down when it hides.
-    val barBottomPadding by androidx.compose.animation.core.animateDpAsState(
-        targetValue = if (isControlsVisible) 86.dp else 28.dp,
-        label = "selectionBarBottomPadding"
-    )
 
     AnimatedVisibility(
         visible = selectedText != null,
@@ -94,7 +84,7 @@ fun PdfSelectionActionOverlay(
         exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
         modifier = modifier
             .navigationBarsPadding()
-            .padding(bottom = barBottomPadding)
+            .padding(bottom = 28.dp)
     ) {
         val selText = selectedText.orEmpty()
         val lastApp = availableApps.firstOrNull()

@@ -27,6 +27,14 @@ data class LastSharedApp(
 class ShareTargetReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
         if (intent == null) return
+        // This receiver is exported (the system must reach it with the chooser
+        // result), so validate the intent instead of trusting any sender:
+        // only accept our own chooser-callback action, and only record
+        // components that are actually installed on the device.
+        if (intent.action != LastShareAppManager.ACTION_SHARE_CHOSEN) {
+            Log.w("ShareTargetReceiver", "Ignoring broadcast with unexpected action: ${intent.action}")
+            return
+        }
         try {
             val chosenComponent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 intent.getParcelableExtra(Intent.EXTRA_CHOSEN_COMPONENT, ComponentName::class.java)
@@ -36,6 +44,8 @@ class ShareTargetReceiver : BroadcastReceiver() {
             }
 
             if (chosenComponent != null) {
+                // Throws NameNotFoundException for spoofed/uninstalled packages.
+                context.packageManager.getApplicationInfo(chosenComponent.packageName, 0)
                 LastShareAppManager.saveLastSharedApp(context, chosenComponent)
             }
         } catch (e: Exception) {
@@ -50,7 +60,7 @@ object LastShareAppManager {
     private const val KEY_CLASS = "last_share_cls"
     private const val KEY_NAME = "last_share_name"
     private const val KEY_HISTORY_JSON = "share_history_json"
-    private const val ACTION_SHARE_CHOSEN = "com.example.ACTION_SHARE_CHOSEN"
+    const val ACTION_SHARE_CHOSEN = "com.example.ACTION_SHARE_CHOSEN"
     private const val MAX_HISTORY = 10
 
     @Volatile

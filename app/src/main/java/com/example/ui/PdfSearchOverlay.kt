@@ -46,6 +46,7 @@ fun PdfSearchOverlay(
     query: String,
     results: List<SearchMatch>,
     currentIndex: Int,
+    extractionProgress: ExtractionProgress? = null,
     onQueryChanged: (String) -> Unit,
     onNextMatch: () -> Unit,
     onPrevMatch: () -> Unit,
@@ -95,7 +96,7 @@ fun PdfSearchOverlay(
                         leadingIcon = {
                             Icon(
                                 imageVector = Icons.Default.Search,
-                                contentDescription = "Search",
+                                contentDescription = "検索",
                                 tint = MaterialTheme.colorScheme.primary
                             )
                         },
@@ -107,7 +108,7 @@ fun PdfSearchOverlay(
                                 ) {
                                     Icon(
                                         imageVector = Icons.Default.Close,
-                                        contentDescription = "Clear",
+                                        contentDescription = "クリア",
                                         modifier = Modifier.size(18.dp)
                                     )
                                 }
@@ -131,13 +132,21 @@ fun PdfSearchOverlay(
                     Spacer(modifier = Modifier.width(8.dp))
 
                     if (query.isNotEmpty()) {
+                        val isAnalysing = extractionProgress != null &&
+                            extractionProgress.done < extractionProgress.total
                         Surface(
                             shape = CircleShape,
                             color = if (results.isNotEmpty()) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer,
                             modifier = Modifier.padding(horizontal = 4.dp)
                         ) {
                             Text(
-                                text = if (results.isNotEmpty()) "${currentIndex + 1}/${results.size}" else "0件",
+                                // While pages are still being analysed, "0件" would
+                                // falsely claim there are no hits at all.
+                                text = when {
+                                    results.isNotEmpty() -> "${currentIndex + 1}/${results.size}"
+                                    isAnalysing -> "解析中 ${extractionProgress.done}/${extractionProgress.total}"
+                                    else -> "0件"
+                                },
                                 style = MaterialTheme.typography.labelSmall,
                                 fontWeight = FontWeight.Bold,
                                 color = if (results.isNotEmpty()) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onErrorContainer,
@@ -152,7 +161,7 @@ fun PdfSearchOverlay(
                         ) {
                             Icon(
                                 imageVector = Icons.Default.KeyboardArrowUp,
-                                contentDescription = "Previous Match"
+                                contentDescription = "前の一致"
                             )
                         }
 
@@ -163,7 +172,7 @@ fun PdfSearchOverlay(
                         ) {
                             Icon(
                                 imageVector = Icons.Default.KeyboardArrowDown,
-                                contentDescription = "Next Match"
+                                contentDescription = "次の一致"
                             )
                         }
                     }
@@ -174,9 +183,21 @@ fun PdfSearchOverlay(
                     ) {
                         Icon(
                             imageVector = Icons.Default.Close,
-                            contentDescription = "Close Search"
+                            contentDescription = "検索を閉じる"
                         )
                     }
+                }
+
+                // Analysis progress note: hits may still increase while this shows.
+                if (query.isNotEmpty() && extractionProgress != null &&
+                    extractionProgress.done < extractionProgress.total
+                ) {
+                    Text(
+                        text = "解析中 ${extractionProgress.done}/${extractionProgress.total} ページ… 結果は増える場合があります",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 6.dp, start = 4.dp)
+                    )
                 }
 
                 // If results available, show current snippet preview

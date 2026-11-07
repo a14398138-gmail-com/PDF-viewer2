@@ -20,7 +20,10 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "pdf_viewer_database"
                 )
-                    .fallbackToDestructiveMigration()
+                    // No fallbackToDestructiveMigration: silently wiping the user's
+                    // history and notes on a future schema bump is worse than
+                    // surfacing the missing migration. Schema stays at version 1,
+                    // so existing installs are unaffected by this change.
                     .build()
                 INSTANCE = instance
                 instance

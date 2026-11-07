@@ -66,7 +66,7 @@ class PdfScanner(private val context: Context, private val crossref: CrossrefCli
 
     private fun extractDoi(file: DocumentFile): String? {
         context.contentResolver.openInputStream(file.uri)?.use { input ->
-            PDDocument.load(input, com.tom_roush.pdfbox.io.MemoryUsageSetting.setupTempFileOnly()).use { document ->
+            PDDocument.load(input).use { document ->
                 val metadataText = listOfNotNull(
                     document.documentInformation?.subject,
                     document.documentInformation?.keywords,

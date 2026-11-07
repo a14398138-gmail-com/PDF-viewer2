@@ -161,7 +161,7 @@ fun HomeScreen(
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.PictureAsPdf,
-                                    contentDescription = "PDF Icon",
+                                    contentDescription = "PDFアイコン",
                                     tint = MaterialTheme.colorScheme.onPrimaryContainer,
                                     modifier = Modifier
                                         .padding(7.dp)
@@ -198,7 +198,7 @@ fun HomeScreen(
                     ) {
                         Icon(
                             imageVector = Icons.Default.Search,
-                            contentDescription = "Search History"
+                            contentDescription = "履歴を検索"
                         )
                     }
 
@@ -272,7 +272,7 @@ fun HomeScreen(
                         ) {
                             Icon(
                                 imageVector = Icons.Default.ClearAll,
-                                contentDescription = "Clear All History"
+                                contentDescription = "履歴をすべて削除"
                             )
                         }
                     }
@@ -293,7 +293,7 @@ fun HomeScreen(
                 icon = {
                     Icon(
                         imageVector = Icons.Default.FolderOpen,
-                        contentDescription = "Open File"
+                        contentDescription = "ファイルを開く"
                     )
                 },
                 text = {
@@ -384,10 +384,17 @@ fun PdfHistoryCard(
         sdf.format(Date(item.lastViewedTimestamp))
     }
 
-    val thumbnailBitmap = remember(item.thumbnailPath) {
-        item.thumbnailPath?.let { path ->
-            val file = File(path)
-            if (file.exists()) BitmapFactory.decodeFile(file.absolutePath) else null
+    // Decode off the main thread: doing this synchronously in remember{}
+    // blocked composition (and scrolling) on file I/O + bitmap decoding.
+    val thumbnailBitmap by androidx.compose.runtime.produceState<android.graphics.Bitmap?>(
+        initialValue = null,
+        item.thumbnailPath
+    ) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            item.thumbnailPath?.let { path ->
+                val file = File(path)
+                if (file.exists()) BitmapFactory.decodeFile(file.absolutePath) else null
+            }
         }
     }
 
@@ -417,10 +424,11 @@ fun PdfHistoryCard(
                     .clip(RoundedCornerShape(10.dp))
                     .shadow(1.dp, RoundedCornerShape(10.dp))
             ) {
-                if (thumbnailBitmap != null) {
+                val loadedThumbnail = thumbnailBitmap
+                if (loadedThumbnail != null) {
                     Image(
-                        bitmap = thumbnailBitmap.asImageBitmap(),
-                        contentDescription = "PDF Thumbnail",
+                        bitmap = loadedThumbnail.asImageBitmap(),
+                        contentDescription = "PDFサムネイル",
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
                     )
@@ -431,7 +439,7 @@ fun PdfHistoryCard(
                     ) {
                         Icon(
                             imageVector = Icons.Default.Description,
-                            contentDescription = "PDF Document",
+                            contentDescription = "PDF文書",
                             tint = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.size(32.dp)
                         )
@@ -537,7 +545,7 @@ fun PdfHistoryCard(
                 ) {
                     Icon(
                         imageVector = Icons.Default.MoreVert,
-                        contentDescription = "Options",
+                        contentDescription = "オプション",
                         tint = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }

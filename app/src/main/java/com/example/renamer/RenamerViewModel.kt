@@ -98,14 +98,21 @@ class RenamerViewModel(application: Application) : AndroidViewModel(application)
                 var skipped = 0
                 var warnings = 0
                 withContext(Dispatchers.IO) {
+                    // Snapshot the folder listing once (name -> uri) instead of
+                    // re-listing per candidate, which made renaming O(n^2) in
+                    // large folders. The snapshot is updated after each rename,
+                    // so collisions with earlier batch results are still caught.
+                    val takenNames = mutableMapOf<String, Uri>()
+                    dir.listFiles().forEach { f ->
+                        val n = f.name?.lowercase()
+                        if (n != null) takenNames[n] = f.uri
+                    }
                     for (candidate in selected) {
                         val target = candidate.newName ?: continue
                         val oldUri = candidate.file.uri
                         try {
-                            // Recheck immediately before each write, including other batch results.
-                            val collision = dir.listFiles().any {
-                                it.uri != oldUri && it.name.equals(target, ignoreCase = true)
-                            }
+                            val holder = takenNames[target.lowercase()]
+                            val collision = holder != null && holder != oldUri
                             if (collision || candidate.file.name != candidate.originalName ||
                                 !candidate.file.renameTo(target)) {
                                 skipped++
@@ -116,6 +123,8 @@ class RenamerViewModel(application: Application) : AndroidViewModel(application)
                             skipped++
                             continue
                         }
+                        takenNames.remove(candidate.originalName.lowercase())
+                        takenNames[target.lowercase()] = candidate.file.uri
                         completed.add(candidate)
                         // A provider may change the document URI on rename.
                         try {

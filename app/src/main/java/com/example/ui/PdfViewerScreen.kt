@@ -67,6 +67,7 @@ import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.ScreenRotation
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Translate
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.graphics.ColorFilter
 import com.example.ui.theme.PdfDarkColorMatrix
@@ -87,7 +88,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -95,7 +95,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -108,14 +107,16 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -124,9 +125,6 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
-import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.ui.res.painterResource
 import com.example.R
 import com.example.data.PdfItem
@@ -176,6 +174,11 @@ fun PdfViewerScreen(
     onNextMatch: () -> Unit,
     onPrevMatch: () -> Unit,
     onPageTextRecognized: (Int, PageText) -> Unit = { _, _ -> },
+    extractionProgress: ExtractionProgress? = null,
+    isTranslateMode: Boolean = false,
+    onToggleTranslateMode: (Boolean) -> Unit = {},
+    pageTranslations: Map<Int, List<com.example.pdf.TranslatedBlock>> = emptyMap(),
+    translatingPages: Set<Int> = emptySet(),
     availableShareApps: List<LastSharedApp> = emptyList(),
     onSaveWithoutPassword: () -> Unit = {},
     modifier: Modifier = Modifier
@@ -195,31 +198,6 @@ fun PdfViewerScreen(
 
     var menuExpanded by remember { mutableStateOf(false) }
 
-    // ツールバー (isControlsVisible) とステータスバーを連動させる
-    // - MainActivity で enableEdgeToEdge() 済みなので、hide してもレイアウトは崩れない
-    // - 検索を開くと ViewModel.openSearch() が isControlsVisible = true に戻すため、
-    //   検索中は自動でステータスバーも再表示される
-    val view = LocalView.current
-    val insetsController = remember(view, activity) {
-        activity?.window?.let { window -> WindowCompat.getInsetsController(window, view) }
-    }
-    LaunchedEffect(isControlsVisible, insetsController) {
-        val controller = insetsController ?: return@LaunchedEffect
-        controller.systemBarsBehavior =
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        if (isControlsVisible) {
-            controller.show(WindowInsetsCompat.Type.statusBars())
-        } else {
-            controller.hide(WindowInsetsCompat.Type.statusBars())
-        }
-    }
-    // Viewer を離れたら (Home に戻る等) 必ずステータスバーを戻す
-    DisposableEffect(insetsController) {
-        onDispose {
-            insetsController?.show(WindowInsetsCompat.Type.statusBars())
-        }
-    }
-
     // Direct On-Page Word Selection State
     var activeSelectedText by remember { mutableStateOf<String?>(null) }
     var activeSelectedPage by remember { mutableStateOf<Int?>(null) }
@@ -237,6 +215,23 @@ fun PdfViewerScreen(
     var zoomScale by remember { mutableFloatStateOf(1f) }
     var panOffset by remember { mutableStateOf(Offset.Zero) }
 
+    // Settled zoom (debounced) drives high-resolution re-rendering of pages,
+    // so pinching does not trigger a render per gesture frame.
+    var settledZoomScale by remember { mutableFloatStateOf(1f) }
+    LaunchedEffect(zoomScale) {
+        kotlinx.coroutines.delay(300)
+        settledZoomScale = zoomScale
+    }
+
+    // Current search hit's highlighted words on its page.
+    val currentSearchMatch = searchResults.getOrNull(currentMatchIndex)
+    val searchHighlightIndices = remember(currentSearchMatch, searchQuery, pageTexts) {
+        val match = currentSearchMatch ?: return@remember emptySet<Int>()
+        val page = pageTexts.getOrNull(match.pageIndex) ?: return@remember emptySet<Int>()
+        val ordinal = PdfTextExtractor.occurrenceOrdinal(page, match, searchQuery)
+        PdfTextExtractor.searchHighlightIndices(page, searchQuery, ordinal)
+    }
+
     // Fast-scroll slider dragging state
     var isSliderDragging by remember { mutableStateOf(false) }
     var sliderValue by remember(currentPage) { mutableFloatStateOf(currentPage.toFloat()) }
@@ -248,11 +243,16 @@ fun PdfViewerScreen(
         }
     }
 
-    // Synchronize scroll position with current page indicator
+    // Synchronize scroll position with current page indicator.
+    // Programmatic scrolls (jump/search/slider) set this flag so the resulting
+    // firstVisibleItemIndex changes are not fed back into onPageChanged, which
+    // used to make manual and programmatic scrolling fight each other.
+    var isProgrammaticScroll by remember { mutableStateOf(false) }
     LaunchedEffect(listState) {
         snapshotFlow { listState.firstVisibleItemIndex }
             .distinctUntilChanged()
             .collect { index ->
+                if (isProgrammaticScroll) return@collect
                 if (index < pdfItem.pageCount) {
                     onPageChanged(index)
                     if (!isSliderDragging) {
@@ -265,7 +265,12 @@ fun PdfViewerScreen(
     // Scroll to page when jump / search requested
     LaunchedEffect(currentPage) {
         if (listState.firstVisibleItemIndex != currentPage && !isSliderDragging) {
-            listState.scrollToItem(currentPage)
+            isProgrammaticScroll = true
+            try {
+                listState.scrollToItem(currentPage)
+            } finally {
+                isProgrammaticScroll = false
+            }
         }
     }
 
@@ -276,16 +281,21 @@ fun PdfViewerScreen(
             .testTag("pdf_viewer_screen")
     ) {
         // PDF Pages Container with pinch-to-zoom and pan transformations
+        var viewportSize by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
         Box(
             modifier = Modifier
                 .fillMaxSize()
+                .onSizeChanged { viewportSize = it }
                 .pointerInput(Unit) {
                     detectTransformGestures { _, pan, zoom, _ ->
                         val newScale = (zoomScale * zoom).coerceIn(1f, 4f)
                         zoomScale = newScale
                         if (zoomScale > 1f) {
-                            val maxOffsetX = 1000f * (zoomScale - 1f)
-                            val maxOffsetY = 1500f * (zoomScale - 1f)
+                            // Pan limits derive from the actual viewport size
+                            // (content is scaled around the centre), not from
+                            // hardcoded pixel constants.
+                            val maxOffsetX = viewportSize.width * (zoomScale - 1f) / 2f
+                            val maxOffsetY = viewportSize.height * (zoomScale - 1f) / 2f
                             panOffset = Offset(
                                 x = (panOffset.x + pan.x).coerceIn(-maxOffsetX, maxOffsetX),
                                 y = (panOffset.y + pan.y).coerceIn(-maxOffsetY, maxOffsetY)
@@ -321,6 +331,12 @@ fun PdfViewerScreen(
                         pdfEngine = pdfEngine,
                         pageText = pageText,
                         isDarkMode = isDark,
+                        zoomScale = settledZoomScale,
+                        translatedBlocks = if (isTranslateMode) pageTranslations[pageIndex].orEmpty() else emptyList(),
+                        showTranslateUnsupportedNotice = isTranslateMode && extractionProgress == null &&
+                            pageText != null && !pageText.isNativeTextLayer,
+                        isTranslatingPage = pageIndex in translatingPages,
+                        searchHighlightIndices = if (currentSearchMatch?.pageIndex == pageIndex) searchHighlightIndices else emptySet(),
                         selectedWordIndices = if (activeSelectedPage == pageIndex) activeSelectedWordIndices else emptySet(),
                         onWordsSelected = { wordIndices, text ->
                             activeSelectedPage = pageIndex
@@ -393,7 +409,7 @@ fun PdfViewerScreen(
                             ) {
                                 Icon(
                                     imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                    contentDescription = "Back to History",
+                                    contentDescription = "履歴に戻る",
                                     tint = MaterialTheme.colorScheme.onSurface
                                 )
                             }
@@ -406,7 +422,7 @@ fun PdfViewerScreen(
                                 ) {
                                     Icon(
                                         imageVector = Icons.Default.MoreVert,
-                                        contentDescription = "More Options",
+                                        contentDescription = "その他のオプション",
                                         tint = MaterialTheme.colorScheme.onSurface
                                     )
                                 }
@@ -459,12 +475,44 @@ fun PdfViewerScreen(
                                         modifier = Modifier.testTag("menu_item_rename")
                                     )
 
+                                    // 3. 和訳 (PLaMo layout-preserving translation overlay)
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                text = "和訳",
+                                                fontWeight = if (isTranslateMode) FontWeight.Bold else FontWeight.Medium,
+                                                color = if (isTranslateMode) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                            )
+                                        },
+                                        leadingIcon = {
+                                            Icon(
+                                                Icons.Default.Translate,
+                                                contentDescription = null,
+                                                tint = if (isTranslateMode) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        },
+                                        trailingIcon = if (isTranslateMode) {
+                                            {
+                                                Icon(
+                                                    imageVector = Icons.Default.Check,
+                                                    contentDescription = "和訳オン",
+                                                    tint = MaterialTheme.colorScheme.primary
+                                                )
+                                            }
+                                        } else null,
+                                        onClick = {
+                                            menuExpanded = false
+                                            onToggleTranslateMode(!isTranslateMode)
+                                        },
+                                        modifier = Modifier.testTag("menu_item_translate")
+                                    )
+
                                     androidx.compose.material3.HorizontalDivider(
                                         modifier = Modifier.padding(vertical = 4.dp),
                                         color = MaterialTheme.colorScheme.outlineVariant
                                     )
 
-                                    // 3. テーマモード切り替え (システム / ライト / ダーク)
+                                    // 4. テーマモード切り替え (システム / ライト / ダーク)
                                     ThemeMode.values().forEach { mode ->
                                         DropdownMenuItem(
                                             text = {
@@ -522,9 +570,9 @@ fun PdfViewerScreen(
         // Floating Direct Selection Action Bar (Copy / Share / Quick Share Apps / Web Search)
         PdfSelectionActionOverlay(
             selectedText = activeSelectedText,
-            availableApps = availableShareApps.ifEmpty {
-                remember(activeSelectedText) { LastShareAppManager.getRecentSharedApps(context) }
-            },
+            // The ViewModel preloads this list on IO; never query PackageManager
+            // synchronously during composition (it janks the frame when hit).
+            availableApps = availableShareApps,
             isShareAppsDrawerVisible = isShareAppsDrawerVisible,
             clipboardManager = clipboardManager,
             onDismissSelection = {
@@ -534,7 +582,6 @@ fun PdfViewerScreen(
                 isShareAppsDrawerVisible = false
             },
             onSetShareAppsDrawerVisible = { isShareAppsDrawerVisible = it },
-            isControlsVisible = isControlsVisible,
             modifier = Modifier.align(Alignment.BottomCenter)
         )
 
@@ -544,6 +591,7 @@ fun PdfViewerScreen(
             query = searchQuery,
             results = searchResults,
             currentIndex = currentMatchIndex,
+            extractionProgress = extractionProgress,
             onQueryChanged = onSearchQueryChanged,
             onNextMatch = onNextMatch,
             onPrevMatch = onPrevMatch,
@@ -676,8 +724,8 @@ fun PdfViewerScreen(
         ) {
             Surface(
                 modifier = Modifier
-                    .widthIn(max = 280.dp)
-                    .fillMaxWidth(0.72f)
+                    .widthIn(max = 360.dp)
+                    .fillMaxWidth(0.86f)
                     .height(58.dp)
                     .testTag("pdf_bottom_toolbar"),
                 shape = CircleShape,
@@ -717,7 +765,7 @@ fun PdfViewerScreen(
                     ) {
                         Icon(
                             imageVector = Icons.Default.ScreenRotation,
-                            contentDescription = "回転 (Rotate)",
+                            contentDescription = "回転",
                             tint = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
@@ -733,7 +781,7 @@ fun PdfViewerScreen(
                     ) {
                         Icon(
                             painter = painterResource(id = R.drawable.ic_share_box_arrow),
-                            contentDescription = "シェア (Share)",
+                            contentDescription = "共有",
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(24.dp)
                         )
@@ -748,7 +796,7 @@ fun PdfViewerScreen(
                     ) {
                         Icon(
                             imageVector = Icons.Default.Search,
-                            contentDescription = "検索 (Search)",
+                            contentDescription = "検索",
                             tint = MaterialTheme.colorScheme.primary
                         )
                     }
@@ -782,6 +830,11 @@ fun PdfPageItem(
     pdfEngine: PdfEngine?,
     pageText: PageText?,
     isDarkMode: Boolean = false,
+    zoomScale: Float = 1f,
+    translatedBlocks: List<com.example.pdf.TranslatedBlock> = emptyList(),
+    showTranslateUnsupportedNotice: Boolean = false,
+    isTranslatingPage: Boolean = false,
+    searchHighlightIndices: Set<Int> = emptySet(),
     selectedWordIndices: Set<Int>,
     onWordsSelected: (Set<Int>, String) -> Unit,
     onPageTextRecognized: (PageText) -> Unit,
@@ -801,48 +854,30 @@ fun PdfPageItem(
         pageDimensions.first.toFloat() / pageDimensions.second.toFloat().coerceAtLeast(1f)
     }
 
-    val targetWidth = remember(screenWidthPx) { (screenWidthPx * 1.5).toInt() }
+    // Re-render at higher resolution once pinch zoom settles past 1.5x, so
+    // enlarged text stays sharp instead of just scaling the base bitmap.
+    val targetWidth = remember(screenWidthPx, zoomScale) {
+        val zoomFactor = when {
+            zoomScale >= 2.5f -> 2.5f
+            zoomScale >= 2f -> 2f
+            zoomScale >= 1.5f -> 1.5f
+            else -> 1f
+        }
+        (screenWidthPx * 1.5f * zoomFactor).toInt()
+    }
     val initialCached = remember(pdfEngine, pageIndex, targetWidth) {
         pdfEngine?.getCachedBitmap(pageIndex, targetWidth)
     }
 
     val pageBitmapState = produceState<Bitmap?>(initialValue = initialCached, pdfEngine, pageIndex, targetWidth) {
-        if (value == null && pdfEngine != null) {
-            value = pdfEngine.renderPageBitmap(pageIndex, targetWidth = targetWidth)
+        if (pdfEngine != null) {
+            val rendered = pdfEngine.renderPageBitmap(pageIndex, targetWidth = targetWidth)
+            if (rendered != null) value = rendered
         }
     }
 
     val words = remember(pageText) { pageText?.words.orEmpty() }
     val currentBitmap = pageBitmapState.value
-
-    // On-demand extraction for this page. The ViewModel's background job walks
-    // pages in order from the top, so a page the user jumped straight to (e.g.
-    // the end of a long document) has no words — and therefore no working text
-    // selection — until the job eventually reaches it. Extract just this page
-    // when it is displayed without words.
-    //
-    // The settle delay matters: without it, fast scrolling fired a heavy
-    // PDFBox load + OCR for every page that flashed past, and the contention
-    // made scrolling stutter. Pages that scroll by quickly leave composition
-    // (or get new keys) and cancel this effect long before the delay elapses;
-    // only a page the user actually stops on gets extracted.
-    var textExtractionAttempted by remember(pdfEngine, pageIndex) { mutableStateOf(false) }
-    LaunchedEffect(pdfEngine, pageIndex, pageText, currentBitmap) {
-        val engine = pdfEngine ?: return@LaunchedEffect
-        if (textExtractionAttempted) return@LaunchedEffect
-        if (!pageText?.words.isNullOrEmpty()) return@LaunchedEffect
-        // Wait for the bitmap so the OCR fallback can run on image-only pages
-        val bitmap = currentBitmap ?: return@LaunchedEffect
-        // One beat of settle time before doing any heavy work
-        // (600ms was still short enough that slow-ish scrolling triggered
-        // extraction mid-scroll; 1.5s keeps it for pages the user stops on)
-        kotlinx.coroutines.delay(1500)
-        textExtractionAttempted = true
-        val recognized = PdfTextExtractor.extractPageText(engine.file, bitmap, pageIndex)
-        if (recognized.words.isNotEmpty()) {
-            onPageTextRecognized(recognized)
-        }
-    }
 
     var dragStartWordIndex by remember { mutableStateOf<Int?>(null) }
 
@@ -861,7 +896,7 @@ fun PdfPageItem(
             if (currentBitmap != null) {
                 Image(
                     bitmap = currentBitmap.asImageBitmap(),
-                    contentDescription = "Page ${pageIndex + 1}",
+                    contentDescription = "${pageIndex + 1}ページ",
                     contentScale = ContentScale.FillBounds,
                     colorFilter = if (isDarkMode) ColorFilter.colorMatrix(PdfDarkColorMatrix) else null,
                     modifier = Modifier.fillMaxSize()
@@ -886,7 +921,28 @@ fun PdfPageItem(
                 } else emptyList()
             }
 
+            // Search hit highlight (amber), drawn under the selection highlight.
+            val searchHighlightWords = remember(searchHighlightIndices, words) {
+                if (searchHighlightIndices.isNotEmpty() && words.isNotEmpty()) {
+                    searchHighlightIndices.sorted().mapNotNull { words.getOrNull(it) }
+                } else emptyList()
+            }
+
             Canvas(modifier = Modifier.fillMaxSize()) {
+                if (searchHighlightWords.isNotEmpty()) {
+                    val searchHighlightColor = Color(0x66FFB300)
+                    searchHighlightWords.forEach { word ->
+                        drawRoundRect(
+                            color = searchHighlightColor,
+                            topLeft = Offset(word.relX * pageWPx, word.relY * pageHPx),
+                            size = Size(
+                                (word.relWidth * pageWPx).coerceAtLeast(6f),
+                                (word.relHeight * pageHPx).coerceAtLeast(6f)
+                            ),
+                            cornerRadius = CornerRadius(2f, 2f)
+                        )
+                    }
+                }
                 if (sortedSelectedWords.isNotEmpty()) {
                     // Chrome Selection Colors
                     val chromeHighlightColor = Color(0x663388F6)
@@ -946,16 +1002,70 @@ fun PdfPageItem(
                 }
             }
 
+            // 2b. Translation overlay: paint over each source block's rect
+            // (padded so every source glyph is covered) and draw the
+            // translation strictly inside that rect, keeping the original
+            // layout (columns, figures, formulas) untouched. The drawing is
+            // measure → shrink → clip (see TranslatedTextLayout), so text can
+            // never overlap neighbouring blocks or spill over figures.
+            if (translatedBlocks.isNotEmpty()) {
+                val blockBg = if (isDarkMode) Color(0xFF222428) else Color.White
+                val blockFg = if (isDarkMode) Color(0xFFE8EAED) else Color(0xFF141518)
+                val renderBlocks = remember(translatedBlocks) {
+                    com.example.pdf.PdfBlockExtractor.mergeOverlappingBlocks(translatedBlocks)
+                }
+                val overlayPaint = remember {
+                    android.graphics.Paint().apply {
+                        isAntiAlias = true
+                        typeface = android.graphics.Typeface.DEFAULT
+                    }
+                }
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val measurer = PaintTextMeasurer(overlayPaint)
+                    renderBlocks.forEach { tb ->
+                        drawTranslatedBlock(tb, overlayPaint, measurer, blockBg, blockFg)
+                    }
+                }
+            }
+
+            if (showTranslateUnsupportedNotice && translatedBlocks.isEmpty()) {
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = Color(0x992B2D30),
+                    modifier = Modifier.align(Alignment.Center)
+                ) {
+                    Text(
+                        text = "テキスト層がないため、このページは和訳未対応です",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color.White,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                    )
+                }
+            } else if (isTranslatingPage && translatedBlocks.isEmpty()) {
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = Color(0x992B2D30),
+                    modifier = Modifier.align(Alignment.TopEnd).padding(8.dp)
+                ) {
+                    Text(
+                        text = "翻訳中…",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color.White,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    )
+                }
+            }
+
             // Helper function to find closest word index given page coordinates
-            fun findClosestWordIndex(wordList: List<TextWord>, relX: Float, relY: Float): Int {
-                if (wordList.isEmpty()) return 0
-                val hit = wordList.indexOfFirst { w ->
+            fun findClosestWordIndex(relX: Float, relY: Float): Int {
+                if (words.isEmpty()) return 0
+                val hit = words.indexOfFirst { w ->
                     relX >= (w.relX - 0.02f) && relX <= (w.relX + w.relWidth + 0.02f) &&
                     relY >= (w.relY - 0.015f) && relY <= (w.relY + w.relHeight + 0.015f)
                 }
                 return if (hit != -1) hit else {
-                    wordList.indices.minByOrNull { i ->
-                        val w = wordList[i]
+                    words.indices.minByOrNull { i ->
+                        val w = words[i]
                         val dy = (w.relY + w.relHeight / 2f) - relY
                         val dx = (w.relX + w.relWidth / 2f) - relX
                         (dy * 3f) * (dy * 3f) + dx * dx
@@ -983,7 +1093,7 @@ fun PdfPageItem(
                                 if (words.isNotEmpty()) {
                                     val relX = startOffset.x / pageWPx
                                     val relY = startOffset.y / pageHPx
-                                    val hitIndex = findClosestWordIndex(words, relX, relY)
+                                    val hitIndex = findClosestWordIndex(relX, relY)
                                     dragStartWordIndex = hitIndex
                                     val selectedIndices = setOf(hitIndex)
                                     val text = words[hitIndex].text
@@ -995,7 +1105,7 @@ fun PdfPageItem(
                                 if (startIdx != null && words.isNotEmpty()) {
                                     val curRelX = change.position.x / pageWPx
                                     val curRelY = change.position.y / pageHPx
-                                    val curIndex = findClosestWordIndex(words, curRelX, curRelY)
+                                    val curIndex = findClosestWordIndex(curRelX, curRelY)
 
                                     val minIdx = min(startIdx, curIndex)
                                     val maxIdx = max(startIdx, curIndex)
@@ -1030,13 +1140,6 @@ fun PdfPageItem(
                 val handleTouchSizeDp = 44.dp
                 val handleTouchRadiusPx = with(density) { (handleTouchSizeDp / 2).toPx() }
 
-                // Handle gestures read the latest selection through rememberUpdatedState.
-                // They must NOT key pointerInput on the selection indices: every selection
-                // change would restart pointerInput and cancel the in-progress drag,
-                // which is why the range used to move only one word per drag.
-                val latestWords by rememberUpdatedState(words)
-                val latestSelectedIndices by rememberUpdatedState(selectedWordIndices)
-
                 // Interactive Start Handle (Drag to adjust starting boundary)
                 Box(
                     modifier = Modifier
@@ -1047,34 +1150,23 @@ fun PdfPageItem(
                             )
                         }
                         .size(handleTouchSizeDp)
-                        .pointerInput(pageIndex, pageWPx, pageHPx) {
-                            var dragPosition = Offset.Zero
-                            var anchorIndex = 0
+                        .pointerInput(pageIndex, minSelectedIdx, maxSelectedIdx, words) {
+                            var currentDragStartOffset = Offset.Zero
                             detectDragGestures(
                                 onDragStart = { offset ->
-                                    val selection = latestSelectedIndices
-                                    anchorIndex = selection.maxOrNull() ?: 0
-                                    val startIndex = selection.minOrNull() ?: 0
-                                    val startWord = latestWords.getOrNull(startIndex)
-                                    val pinPosition = if (startWord != null) {
-                                        Offset(startWord.relX * pageWPx, startWord.relY * pageHPx)
-                                    } else {
-                                        Offset.Zero
-                                    }
-                                    dragPosition = pinPosition + offset -
-                                        Offset(handleTouchRadiusPx, handleTouchRadiusPx)
+                                    currentDragStartOffset = Offset(startPinXPx, startPinYPx) + offset - Offset(handleTouchRadiusPx, handleTouchRadiusPx)
                                 },
                                 onDrag = { change, dragAmount ->
                                     change.consume()
-                                    dragPosition += dragAmount
-                                    val curRelX = (dragPosition.x / pageWPx).coerceIn(0f, 1f)
-                                    val curRelY = (dragPosition.y / pageHPx).coerceIn(0f, 1f)
-                                    val newStartIdx = findClosestWordIndex(latestWords, curRelX, curRelY)
+                                    currentDragStartOffset += dragAmount
+                                    val curRelX = (currentDragStartOffset.x / pageWPx).coerceIn(0f, 1f)
+                                    val curRelY = (currentDragStartOffset.y / pageHPx).coerceIn(0f, 1f)
+                                    val newStartIdx = findClosestWordIndex(curRelX, curRelY)
 
-                                    val newMin = min(newStartIdx, anchorIndex)
-                                    val newMax = max(newStartIdx, anchorIndex)
+                                    val newMin = min(newStartIdx, maxSelectedIdx)
+                                    val newMax = max(newStartIdx, maxSelectedIdx)
                                     val newIndices = (newMin..newMax).toSet()
-                                    val text = PdfTextExtractor.formatSelectedWords(latestWords, newIndices)
+                                    val text = PdfTextExtractor.formatSelectedWords(words, newIndices)
                                     onWordsSelected(newIndices, text)
                                 }
                             )
@@ -1092,37 +1184,23 @@ fun PdfPageItem(
                             )
                         }
                         .size(handleTouchSizeDp)
-                        .pointerInput(pageIndex, pageWPx, pageHPx) {
-                            var dragPosition = Offset.Zero
-                            var anchorIndex = 0
+                        .pointerInput(pageIndex, minSelectedIdx, maxSelectedIdx, words) {
+                            var currentDragEndOffset = Offset.Zero
                             detectDragGestures(
                                 onDragStart = { offset ->
-                                    val selection = latestSelectedIndices
-                                    anchorIndex = selection.minOrNull() ?: 0
-                                    val endIndex = selection.maxOrNull() ?: 0
-                                    val endWord = latestWords.getOrNull(endIndex)
-                                    val pinPosition = if (endWord != null) {
-                                        Offset(
-                                            (endWord.relX + endWord.relWidth) * pageWPx,
-                                            (endWord.relY + endWord.relHeight) * pageHPx
-                                        )
-                                    } else {
-                                        Offset.Zero
-                                    }
-                                    dragPosition = pinPosition + offset -
-                                        Offset(handleTouchRadiusPx, handleTouchRadiusPx)
+                                    currentDragEndOffset = Offset(endPinXPx, endPinYPx) + offset - Offset(handleTouchRadiusPx, handleTouchRadiusPx)
                                 },
                                 onDrag = { change, dragAmount ->
                                     change.consume()
-                                    dragPosition += dragAmount
-                                    val curRelX = (dragPosition.x / pageWPx).coerceIn(0f, 1f)
-                                    val curRelY = (dragPosition.y / pageHPx).coerceIn(0f, 1f)
-                                    val newEndIdx = findClosestWordIndex(latestWords, curRelX, curRelY)
+                                    currentDragEndOffset += dragAmount
+                                    val curRelX = (currentDragEndOffset.x / pageWPx).coerceIn(0f, 1f)
+                                    val curRelY = (currentDragEndOffset.y / pageHPx).coerceIn(0f, 1f)
+                                    val newEndIdx = findClosestWordIndex(curRelX, curRelY)
 
-                                    val newMin = min(anchorIndex, newEndIdx)
-                                    val newMax = max(anchorIndex, newEndIdx)
+                                    val newMin = min(minSelectedIdx, newEndIdx)
+                                    val newMax = max(minSelectedIdx, newEndIdx)
                                     val newIndices = (newMin..newMax).toSet()
-                                    val text = PdfTextExtractor.formatSelectedWords(latestWords, newIndices)
+                                    val text = PdfTextExtractor.formatSelectedWords(words, newIndices)
                                     onWordsSelected(newIndices, text)
                                 }
                             )
@@ -1131,6 +1209,102 @@ fun PdfPageItem(
                 )
             }
         }
+    }
+}
+
+/** Bridges [android.graphics.Paint] to the pure layout math in [com.example.pdf.TranslatedTextLayout]. */
+private class PaintTextMeasurer(
+    private val paint: android.graphics.Paint
+) : com.example.pdf.TranslatedTextLayout.Measurer {
+    override fun textWidth(text: String, fontSizePx: Float): Float {
+        paint.textSize = fontSizePx
+        return paint.measureText(text)
+    }
+
+    override fun fontHeight(fontSizePx: Float): Float {
+        paint.textSize = fontSizePx
+        val fm = paint.fontMetrics
+        return fm.descent - fm.ascent
+    }
+}
+
+/**
+ * Paints one translated block: erases the source text under a padded rect,
+ * then draws the translation inside that rect only. The font size comes
+ * from the source line height and is shrunk by [com.example.pdf.TranslatedTextLayout]
+ * until the wrapped lines fit; the native canvas is clipped to the rect as
+ * a final guarantee, so glyphs can never reach neighbouring content.
+ */
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawTranslatedBlock(
+    tb: com.example.pdf.TranslatedBlock,
+    paint: android.graphics.Paint,
+    measurer: com.example.pdf.TranslatedTextLayout.Measurer,
+    bg: Color,
+    fg: Color
+) {
+    val b = tb.block
+    val pageW = size.width
+    val pageH = size.height
+    if (pageW <= 0f || pageH <= 0f) return
+    val avgLineHPx = when {
+        b.avgLineHeight > 0f -> b.avgLineHeight * pageH
+        b.lineCount > 0 -> (b.relHeight * pageH) / b.lineCount
+        else -> b.relHeight * pageH
+    }
+    if (avgLineHPx <= 0f) return
+
+    // Erase rect: block rect plus padding (title-size glyphs included), so
+    // no source character peeks out from under the translation.
+    val padX = max(2f, avgLineHPx * 0.35f)
+    val padY = max(2f, avgLineHPx * 0.22f)
+    val eraseLeft = (b.relX * pageW - padX).coerceAtLeast(0f)
+    val eraseTop = (b.relY * pageH - padY).coerceAtLeast(0f)
+    val eraseRight = ((b.relX + b.relWidth) * pageW + padX).coerceAtMost(pageW)
+    val eraseBottom = ((b.relY + b.relHeight) * pageH + padY).coerceAtMost(pageH)
+    if (eraseRight <= eraseLeft || eraseBottom <= eraseTop) return
+    drawRect(
+        color = bg,
+        topLeft = Offset(eraseLeft, eraseTop),
+        size = Size(eraseRight - eraseLeft, eraseBottom - eraseTop)
+    )
+
+    // Text area: inside the erased rect, slightly inset.
+    val insetX = max(1f, padX * 0.4f)
+    val insetY = max(1f, padY * 0.4f)
+    val textLeft = eraseLeft + insetX
+    val textTop = eraseTop + insetY
+    val textWidth = eraseRight - eraseLeft - insetX * 2
+    val textHeight = eraseBottom - eraseTop - insetY * 2
+    if (textWidth <= 0f || textHeight <= 0f) return
+
+    // Start from the source's own font size (line height / line-height
+    // factor) so body text stays body-sized and titles stay large.
+    val startFontPx = (avgLineHPx / com.example.pdf.TranslatedTextLayout.MIN_LINE_HEIGHT_FACTOR)
+        .coerceIn(4f, pageH * 0.08f)
+    val minFontPx = 5.dp.toPx()
+    val result = com.example.pdf.TranslatedTextLayout.layout(
+        text = tb.translatedText,
+        maxWidthPx = textWidth,
+        maxHeightPx = textHeight,
+        startFontSizePx = startFontPx,
+        minFontSizePx = minFontPx,
+        measurer = measurer
+    )
+    if (result.lines.isEmpty()) return
+
+    paint.textSize = result.fontSizePx
+    paint.color = fg.toArgb()
+    val fm = paint.fontMetrics
+    val fontHeight = fm.descent - fm.ascent
+    // Centre each line's font box inside its line-height slot.
+    val baselineOffset = (result.lineHeightPx - fontHeight) / 2f - fm.ascent
+    with(drawContext.canvas.nativeCanvas) {
+        val saveCount = save()
+        clipRect(textLeft, textTop, textLeft + textWidth, textTop + textHeight)
+        result.lines.forEachIndexed { i, line ->
+            drawText(line, textLeft, textTop + baselineOffset + i * result.lineHeightPx, paint)
+        }
+        restoreToCount(saveCount)
     }
 }
 

@@ -9,9 +9,13 @@ import com.example.data.AppDatabase
 import com.example.data.PdfItem
 import com.example.data.PdfRepository
 import com.example.pdf.PageText
+import com.example.pdf.PdfBlockExtractor
 import com.example.pdf.PdfEngine
+import com.example.pdf.PdfTextCache
 import com.example.pdf.PdfTextExtractor
 import com.example.pdf.SearchMatch
+import com.example.pdf.TranslatedBlock
+import com.example.translate.TranslateController
 import com.example.ui.theme.ThemeMode
 import com.example.util.LastShareAppManager
 import com.example.util.LastSharedApp
@@ -25,6 +29,9 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+
+/** Extraction progress for the search UI: pages fully analysed out of [total]. */
+data class ExtractionProgress(val done: Int, val total: Int)
 
 class PdfViewerViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -81,8 +88,9 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
     private val _selectedText = MutableStateFlow<String?>(null)
     val selectedText: StateFlow<String?> = _selectedText.asStateFlow()
 
-    private val _isTextSelectModalOpen = MutableStateFlow(false)
-    val isTextSelectModalOpen: StateFlow<Boolean> = _isTextSelectModalOpen.asStateFlow()
+    // Text extraction progress (for the "解析中 n/m" search indicator)
+    private val _extractionProgress = MutableStateFlow<ExtractionProgress?>(null)
+    val extractionProgress: StateFlow<ExtractionProgress?> = _extractionProgress.asStateFlow()
 
     // Dialogs
     private val _isNoteDialogOpen = MutableStateFlow(false)
@@ -115,11 +123,11 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
     init {
         PdfEngine.initMemoryPressureCallbacks(application)
         PdfTextExtractor.init(application)
-        PdfTextExtractor.onOcrModelStatusListener = { isPreparing, msg ->
+        PdfTextExtractor.onOcrModelStatusListener = { isPreparing, _ ->
+            // Only track the flag. The old code also copied the "preparing"
+            // message into _errorMessage, which surfaced it as a toast even
+            // though nothing had gone wrong.
             _isOcrPreparing.value = isPreparing
-            if (isPreparing && msg != null && _errorMessage.value == null) {
-                _errorMessage.value = msg
-            }
         }
         val db = AppDatabase.getDatabase(application)
         repository = PdfRepository(application, db.pdfHistoryDao())
@@ -159,29 +167,42 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
         pendingPdfUri?.let { openPdf(it, password) }
     }
 
+    // Latest-wins opening: a new open request cancels the previous one instead
+    // of being silently ignored (the old early-return made the app look broken
+    // when a second file was opened while the first was still loading).
+    private var openGeneration = 0
+
     fun openPdf(uri: Uri, password: String? = null) {
-        if (_isLoading.value && openJob?.isActive == true) return
         if (password == null) cancelPassword()
+        val generation = ++openGeneration
+        openJob?.cancel()
         openJob = viewModelScope.launch {
             _isLoading.value = true
             _errorMessage.value = null
-            // Tracks where an OutOfMemoryError happened so the error message can name the phase
-            var phase = "ファイル読み込み"
+            var newEngine: PdfEngine? = null
             try {
-                val opened = repository.openAndRecordPdf(uri, password = password ?: "")
-                val item = opened.item
-                val extractedPages = opened.pages
+                val (item, extractedPages) = repository.openAndRecordPdf(uri, password = password ?: "")
                 val source = File(requireNotNull(item.filePath))
-                phase = "ビューア準備"
                 val engine = withContext(Dispatchers.IO) {
-                    PdfEngine(getApplication(), source, password ?: "", preparedFile = opened.renderFile)
+                    PdfEngine(getApplication(), source, password ?: "")
                 }
-                backgroundTextJob?.cancel()
-                backgroundTextJob?.join()
+                newEngine = engine
+                extractionJob?.cancel()
+                extractionJob?.join()
+                if (generation != openGeneration) {
+                    engine.close()
+                    newEngine = null
+                    return@launch
+                }
                 currentEngine?.close()
                 currentEngine = engine
+                newEngine = null
+                currentCacheKey = withContext(Dispatchers.IO) {
+                    try { PdfTextCache.keyFor(source) } catch (_: Exception) { null }
+                }
+                resetExtractionState()
+                resetTranslationState()
                 val targetPage = item.lastOpenedPage.coerceIn(0, (item.pageCount - 1).coerceAtLeast(0))
-                phase = "最初のページ描画"
                 engine.renderPageBitmap(targetPage)
                 _activePdfItem.value = item
                 _activePagesText.value = extractedPages
@@ -190,53 +211,32 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                 closeSearch()
                 _selectedText.value = null
                 cancelPassword()
-                startBackgroundTextExtraction(engine, engine.file, item.pageCount, targetPage)
-                maybeGenerateThumbnail(engine, item)
+                scheduleExtraction(targetPage)
             } catch (e: com.tom_roush.pdfbox.pdmodel.encryption.InvalidPasswordException) {
-                pendingPdfUri = uri
-                _passwordRequired.value = true
-                _passwordError.value = if (password == null) null else "パスワードが違います。もう一度入力してください。"
+                if (generation == openGeneration) {
+                    pendingPdfUri = uri
+                    _passwordRequired.value = true
+                    _passwordError.value = if (password == null) null else "パスワードが違います。もう一度入力してください。"
+                }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
-            } catch (e: OutOfMemoryError) {
-                // Large files can exhaust the heap while loading/rendering; report instead of crashing
-                android.util.Log.e("PdfViewerViewModel", "Out of memory while opening PDF (phase: $phase)", e)
-                cancelPassword()
-                _errorMessage.value = "ファイルが大きすぎてメモリが不足しました（段階: $phase）。他のアプリを閉じてから再度お試しください。"
             } catch (e: Exception) {
-                cancelPassword()
-                _errorMessage.value = "PDFを開けませんでした: ${e.localizedMessage}"
+                if (generation == openGeneration) {
+                    cancelPassword()
+                    _errorMessage.value = "PDFを開けませんでした: ${e.localizedMessage}"
+                }
             } finally {
-                _isPendingIntentOpen.value = false
-                _isLoading.value = false
+                newEngine?.close()
+                if (generation == openGeneration) {
+                    _isPendingIntentOpen.value = false
+                    _isLoading.value = false
+                }
             }
         }
     }
 
     fun openPdfItem(historyItem: PdfItem) {
         openPdf(Uri.parse(historyItem.uriString))
-    }
-
-    /**
-     * Generates the history thumbnail with the already-open engine, after the
-     * viewer is up. (This used to run inside the repository during open with a
-     * second engine — a concurrent full parse that starved large-file opens.)
-     */
-    private fun maybeGenerateThumbnail(engine: PdfEngine, item: PdfItem) {
-        val existing = item.thumbnailPath
-        if (!existing.isNullOrEmpty() && File(existing).exists()) return
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val generated = engine.generateAndSaveThumbnail()
-                if (!generated.isNullOrEmpty()) {
-                    repository.updateThumbnail(item.uriString, generated)
-                }
-            } catch (e: Exception) {
-                android.util.Log.w("PdfViewerViewModel", "Thumbnail generation failed: ${e.message}")
-            } catch (e: OutOfMemoryError) {
-                android.util.Log.w("PdfViewerViewModel", "Thumbnail generation ran out of memory")
-            }
-        }
     }
 
     fun saveWithoutPassword(destination: Uri) {
@@ -273,21 +273,32 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun openSamplePdf() {
+        // Supersede any in-flight openPdf, and build the engine on IO: the old
+        // code constructed PdfEngine (PDFBox work in its initializer) directly
+        // on the main thread, unlike every other open path.
+        openGeneration++
+        openJob?.cancel()
         viewModelScope.launch {
             _isLoading.value = true
             _errorMessage.value = null
             try {
-                backgroundTextJob?.cancel()
+                extractionJob?.cancel()
+                extractionJob?.join()
                 currentEngine?.close()
                 currentEngine = null
 
-                val opened = repository.openSamplePdf()
-                val item = opened.item
-                val extractedPages = opened.pages
+                val (item, extractedPages) = repository.openSamplePdf()
                 val file = item.filePath?.let { File(it) }
                 if (file != null && file.exists()) {
-                    val engine = PdfEngine(getApplication(), file, preparedFile = opened.renderFile)
+                    val engine = withContext(Dispatchers.IO) {
+                        PdfEngine(getApplication(), file)
+                    }
                     currentEngine = engine
+                    currentCacheKey = withContext(Dispatchers.IO) {
+                        try { PdfTextCache.keyFor(file) } catch (_: Exception) { null }
+                    }
+                    resetExtractionState()
+                    resetTranslationState()
 
                     // Pre-render page 0 immediately
                     engine.renderPageBitmap(0)
@@ -299,9 +310,10 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                     closeSearch()
                     _selectedText.value = null
 
-                    startBackgroundTextExtraction(engine, file, item.pageCount, 0)
-                    maybeGenerateThumbnail(engine, item)
+                    scheduleExtraction(0)
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _errorMessage.value = "サンプルPDFを開けませんでした: ${e.localizedMessage}"
             } finally {
@@ -311,112 +323,335 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    private var backgroundTextJob: Job? = null
+    // ---- Demand-driven text extraction -------------------------------------
+    // Phase 1: the visible page ±3, with OCR fallback (what the user is reading).
+    // Phase 2: every remaining page, native text only (cheap; makes search
+    //          complete for text PDFs without rendering/OCR-ing hundreds of pages).
+    // Phase 3: only when a search is running, OCR the still-empty pages so
+    //          scanned documents become searchable on demand.
+    // Results are cached on disk (PdfTextCache, keyed by file content hash) and
+    // reused on the next open.
+    private var extractionJob: Job? = null
+    private var currentCacheKey: String? = null
+    private val nativeCheckedPages = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
+    private val ocrCheckedPages = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
+    @Volatile private var searchOcrActive = false
 
-    private fun startBackgroundTextExtraction(
-        engine: PdfEngine,
-        file: File?,
-        pageCount: Int,
-        initialPage: Int = 0
-    ) {
-        backgroundTextJob?.cancel()
+    private fun resetExtractionState() {
+        nativeCheckedPages.clear()
+        ocrCheckedPages.clear()
+        searchOcrActive = false
+        _extractionProgress.value = null
+    }
+
+    private fun scheduleExtraction(focusPage: Int, ocrAllPending: Boolean = false) {
+        val engine = currentEngine ?: return
+        val item = _activePdfItem.value ?: return
+        val pageCount = item.pageCount
         if (pageCount <= 0) return
+        if (ocrAllPending) searchOcrActive = true
+        val cacheKey = currentCacheKey
+        val renderFile = engine.file
 
-        backgroundTextJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+        extractionJob?.cancel()
+        extractionJob = viewModelScope.launch(Dispatchers.Default) {
             // Give UI immediate rendering priority for the first frame
-            kotlinx.coroutines.delay(100)
+            kotlinx.coroutines.delay(80)
 
-            val session = if (file != null && file.exists()) {
-                PdfTextExtractor.openSession(file)
-            } else {
-                null
+            val session = if (renderFile.exists()) PdfTextExtractor.openSession(renderFile) else null
+            val list = _activePagesText.value.toMutableList()
+            while (list.size < pageCount) {
+                list.add(PageText(pageIndex = list.size, fullText = ""))
             }
 
-            // Build priority order: current page and immediate neighbors first (±3 pages)
-            val processedPages = BooleanArray(pageCount) { false }
-            val priorityPages = mutableListOf<Int>()
-            for (delta in 0..3) {
-                val p1 = initialPage + delta
-                if (p1 in 0 until pageCount && !processedPages[p1]) {
-                    priorityPages.add(p1)
-                    processedPages[p1] = true
+            fun publishProgress() {
+                val settled = (0 until pageCount).count { p ->
+                    list.getOrNull(p)?.words?.isNotEmpty() == true ||
+                        p in ocrCheckedPages ||
+                        (p in nativeCheckedPages && !searchOcrActive)
                 }
-                val p2 = initialPage - delta
-                if (p2 in 0 until pageCount && !processedPages[p2]) {
-                    priorityPages.add(p2)
-                    processedPages[p2] = true
-                }
+                _extractionProgress.value =
+                    if (settled >= pageCount) null else ExtractionProgress(settled, pageCount)
             }
 
-            // Remaining pages in sequential order
-            val remainingPages = (0 until pageCount).filter { !processedPages[it] }
-
-            // Local mutable list initialized from current extracted state to avoid O(N^2) allocations
-            val currentList = _activePagesText.value.toMutableList()
-            while (currentList.size < pageCount) {
-                currentList.add(PageText(pageIndex = currentList.size, fullText = ""))
+            suspend fun process(pageIdx: Int, allowOcr: Boolean) {
+                if (list[pageIdx].words.isNotEmpty() && pageIdx in nativeCheckedPages) return
+                // 0. Disk cache first.
+                if (cacheKey != null && pageIdx !in nativeCheckedPages) {
+                    val cached = withContext(Dispatchers.IO) {
+                        PdfTextCache.loadPage(getApplication(), cacheKey, pageIdx)
+                    }
+                    if (cached != null && cached.words.isNotEmpty()) {
+                        nativeCheckedPages.add(pageIdx)
+                        ocrCheckedPages.add(pageIdx)
+                        list[pageIdx] = cached
+                        _activePagesText.value = list.toList()
+                        publishProgress()
+                        refreshSearchResults()
+                        return
+                    }
+                }
+                // 1. Native text layer.
+                var pageText: PageText? = null
+                if (pageIdx !in nativeCheckedPages) {
+                    pageText = session?.extractNativeText(pageIdx)
+                    nativeCheckedPages.add(pageIdx)
+                }
+                // 2. OCR fallback (only where allowed).
+                if ((pageText == null || pageText.words.isEmpty()) && allowOcr && pageIdx !in ocrCheckedPages) {
+                    val bitmap = engine.renderPageBitmap(pageIdx, targetWidth = 1080)
+                    if (bitmap != null) {
+                        pageText = PdfTextExtractor.extractPageFromBitmap(bitmap, pageIdx)
+                    }
+                    ocrCheckedPages.add(pageIdx)
+                }
+                if (pageText != null) {
+                    list[pageIdx] = pageText
+                    if (pageText.words.isNotEmpty() && cacheKey != null) {
+                        withContext(Dispatchers.IO) {
+                            PdfTextCache.savePage(getApplication(), cacheKey, pageText)
+                        }
+                    }
+                }
+                _activePagesText.value = list.toList()
+                publishProgress()
+                refreshSearchResults()
             }
 
             try {
-                session.use { activeSession ->
-                    // 1. Process priority pages immediately
-                    for (pageIdx in priorityPages) {
-                        var pageText: PageText? = null
-                        if (activeSession != null) {
-                            pageText = activeSession.extractNativeText(pageIdx)
-                        }
-
-                        // Fall back to OCR only if no native text exists
-                        if (pageText == null || pageText.words.isEmpty()) {
-                            val bitmap = engine.renderPageBitmap(pageIdx, targetWidth = 1080)
-                            if (bitmap != null) {
-                                pageText = PdfTextExtractor.extractPageFromBitmap(bitmap, pageIdx)
-                            }
-                        }
-
-                        if (pageText != null) {
-                            currentList[pageIdx] = pageText
-                            _activePagesText.value = currentList.toList()
+                session.use {
+                    // Phase 1: focus window with OCR.
+                    for (delta in 0..3) {
+                        for (p in listOf(focusPage + delta, focusPage - delta)) {
+                            if (p in 0 until pageCount) process(p, allowOcr = true)
                         }
                     }
-
-                    // 2. Process remaining pages in batches with small yield to avoid thermal throttling
-                    var pendingBatchCount = 0
-                    for (pageIdx in remainingPages) {
-                        var pageText: PageText? = null
-                        if (activeSession != null) {
-                            pageText = activeSession.extractNativeText(pageIdx)
-                        }
-
-                        if (pageText == null || pageText.words.isEmpty()) {
-                            val bitmap = engine.renderPageBitmap(pageIdx, targetWidth = 1080)
-                            if (bitmap != null) {
-                                pageText = PdfTextExtractor.extractPageFromBitmap(bitmap, pageIdx)
-                            }
-                        }
-
-                        if (pageText != null) {
-                            currentList[pageIdx] = pageText
-                            pendingBatchCount++
-                            // Batch commit every 4 pages to minimize recompositions
-                            if (pendingBatchCount >= 4) {
-                                _activePagesText.value = currentList.toList()
-                                pendingBatchCount = 0
-                            }
-                        }
-                        kotlinx.coroutines.delay(15)
+                    // Phase 2: remaining pages, native text only.
+                    for (p in 0 until pageCount) {
+                        if (p !in nativeCheckedPages) process(p, allowOcr = false)
                     }
-
-                    if (pendingBatchCount > 0) {
-                        _activePagesText.value = currentList.toList()
+                    // Phase 3: search-driven OCR of still-empty pages.
+                    if (searchOcrActive) {
+                        for (p in 0 until pageCount) {
+                            if (p !in ocrCheckedPages && list[p].words.isEmpty()) {
+                                process(p, allowOcr = true)
+                            }
+                        }
                     }
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
-                android.util.Log.w("PdfViewerViewModel", "Background text extraction interrupted: ${e.message}")
-            } catch (e: OutOfMemoryError) {
-                // Never let background OCR/extraction of a huge file crash the app
-                android.util.Log.w("PdfViewerViewModel", "Background text extraction stopped: out of memory")
+                android.util.Log.w("PdfViewerViewModel", "Text extraction interrupted: ${e.message}")
+            } finally {
+                publishProgress()
             }
+        }
+    }
+
+    // ---- PLaMo paper translation (layout-preserving overlay) ---------------
+    // Only pages with a live native text layer are supported; scanned/OCR
+    // pages are reported as unsupported by the UI. Translation runs per layout
+    // block, starting from the visible page outwards, and results are cached
+    // on disk per block (PdfTextCache) so reopening never re-translates.
+    private val translateController by lazy { TranslateController(getApplication()) }
+
+    private val _isTranslateMode = MutableStateFlow(false)
+    val isTranslateMode: StateFlow<Boolean> = _isTranslateMode.asStateFlow()
+
+    private val _pageTranslations = MutableStateFlow<Map<Int, List<TranslatedBlock>>>(emptyMap())
+    val pageTranslations: StateFlow<Map<Int, List<TranslatedBlock>>> = _pageTranslations.asStateFlow()
+
+    private val _translatingPages = MutableStateFlow<Set<Int>>(emptySet())
+    val translatingPages: StateFlow<Set<Int>> = _translatingPages.asStateFlow()
+
+    private val _showTranslateModelSetup = MutableStateFlow(false)
+    val showTranslateModelSetup: StateFlow<Boolean> = _showTranslateModelSetup.asStateFlow()
+
+    private val _translateDownloadProgress = MutableStateFlow<Float?>(null)
+    val translateDownloadProgress: StateFlow<Float?> = _translateDownloadProgress.asStateFlow()
+
+    private val _isTranslateModelLoading = MutableStateFlow(false)
+    val isTranslateModelLoading: StateFlow<Boolean> = _isTranslateModelLoading.asStateFlow()
+
+    private val claimedTranslationPages = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
+
+    private fun resetTranslationState() {
+        _isTranslateMode.value = false
+        _pageTranslations.value = emptyMap()
+        _translatingPages.value = emptySet()
+        claimedTranslationPages.clear()
+    }
+
+    fun setTranslateMode(on: Boolean) {
+        if (!on) {
+            _isTranslateMode.value = false
+            return
+        }
+        if (!translateController.modelExists()) {
+            // Guide the user to the model download / file import first.
+            _showTranslateModelSetup.value = true
+            return
+        }
+        _isTranslateMode.value = true
+        ensureModelLoadedAndSchedule(_currentPage.value)
+    }
+
+    fun dismissTranslateModelSetup() {
+        _showTranslateModelSetup.value = false
+    }
+
+    fun downloadTranslateModel() {
+        viewModelScope.launch {
+            _translateDownloadProgress.value = 0f
+            val ok = translateController.downloadModel { frac ->
+                _translateDownloadProgress.value = frac
+            }
+            _translateDownloadProgress.value = null
+            if (ok) {
+                _showTranslateModelSetup.value = false
+                setTranslateMode(true)
+            } else {
+                _errorMessage.value = "翻訳モデルのダウンロードに失敗しました"
+            }
+        }
+    }
+
+    fun importTranslateModel(uri: Uri) {
+        viewModelScope.launch {
+            val ok = translateController.importModel(uri)
+            if (ok) {
+                _showTranslateModelSetup.value = false
+                setTranslateMode(true)
+            } else {
+                _errorMessage.value = "選択したファイルは翻訳モデルとして使えませんでした"
+            }
+        }
+    }
+
+    private fun ensureModelLoadedAndSchedule(focusPage: Int) {
+        viewModelScope.launch {
+            if (translateController.handle == 0L) {
+                _isTranslateModelLoading.value = true
+                val result = translateController.loadModel()
+                _isTranslateModelLoading.value = false
+                if (result is TranslateController.LoadResult.Error) {
+                    _errorMessage.value = result.message
+                    _isTranslateMode.value = false
+                    return@launch
+                }
+            }
+            schedulePageTranslations(focusPage)
+        }
+    }
+
+    /** Queues translation for the focus page and its neighbours (never all pages). */
+    fun schedulePageTranslations(focusPage: Int) {
+        if (!_isTranslateMode.value) return
+        val pageCount = currentItemPageCount()
+        if (pageCount <= 0) return
+        val order = listOf(focusPage, focusPage + 1, focusPage - 1, focusPage + 2, focusPage - 2)
+            .filter { it in 0 until pageCount }
+            .distinct()
+        for (page in order) {
+            if (page in claimedTranslationPages) continue
+            viewModelScope.launch(Dispatchers.Default) {
+                translatePageInternal(page)
+            }
+        }
+    }
+
+    private fun isTranslatableText(text: String): Boolean =
+        text.any { it.isLetter() } && text.trim().length >= 3
+
+    private suspend fun translatePageInternal(pageIdx: Int) {
+        if (!claimedTranslationPages.add(pageIdx)) return
+        _translatingPages.value = _translatingPages.value + pageIdx
+        var completed = false
+        try {
+            val pageText = _activePagesText.value.getOrNull(pageIdx) ?: return
+            // Native text layer only: OCR pages are out of scope by design.
+            if (!pageText.isNativeTextLayer) return
+            val blocks = PdfBlockExtractor.blocksFromPageText(pageText)
+                .filter { isTranslatableText(it.text) }
+            if (blocks.isEmpty()) return
+
+            val cacheKey = currentCacheKey
+            val cached = if (cacheKey != null) {
+                withContext(Dispatchers.IO) {
+                    PdfTextCache.loadTranslations(getApplication(), cacheKey, pageIdx)
+                }
+            } else {
+                emptyMap()
+            }
+
+            val results = mutableListOf<TranslatedBlock>()
+            var failed = false
+            for (block in blocks) {
+                if (!_isTranslateMode.value) break
+                val hit = cached[block.blockIndex]
+                if (hit != null && hit.first == block.text) {
+                    results.add(TranslatedBlock(block, hit.second))
+                    continue
+                }
+                val src = TranslateController.detectLang(block.text)
+                val tgt = if (src == "ja") "en" else "ja"
+                val separator = if (tgt == "ja") "" else " "
+                val translated = StringBuilder()
+                for (chunk in PdfBlockExtractor.splitIntoChunks(block.text)) {
+                    when (val r = translateController.translateStream(chunk, src, tgt) {}) {
+                        is TranslateController.TranslateResult.Ok -> {
+                            if (translated.isNotEmpty()) translated.append(separator)
+                            translated.append(r.text)
+                        }
+                        is TranslateController.TranslateResult.Error -> {
+                            android.util.Log.w("PdfViewerViewModel", "Block translation failed (page $pageIdx): ${r.message}")
+                            failed = true
+                            break
+                        }
+                    }
+                }
+                if (failed) break
+                val translatedText = translated.toString().trim()
+                if (translatedText.isNotEmpty()) {
+                    results.add(TranslatedBlock(block, translatedText))
+                    if (cacheKey != null) {
+                        withContext(Dispatchers.IO) {
+                            PdfTextCache.saveTranslation(
+                                getApplication(), cacheKey, pageIdx,
+                                block.blockIndex, block.text, translatedText
+                            )
+                        }
+                    }
+                }
+                // Publish progressively so the page fills in block by block.
+                _pageTranslations.value = _pageTranslations.value + (pageIdx to results.toList())
+            }
+            completed = !failed && results.isNotEmpty()
+            if (results.isNotEmpty()) {
+                _pageTranslations.value = _pageTranslations.value + (pageIdx to results.toList())
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            android.util.Log.w("PdfViewerViewModel", "Page translation failed (page $pageIdx): ${e.message}")
+        } finally {
+            _translatingPages.value = _translatingPages.value - pageIdx
+            if (!completed) {
+                // Allow a later visit to retry unfinished pages.
+                claimedTranslationPages.remove(pageIdx)
+            }
+        }
+    }
+
+    /** Re-runs the current search over newly extracted pages (without jumping). */
+    private fun refreshSearchResults() {
+        val query = _searchQuery.value
+        if (query.isBlank() || !_isSearchActive.value) return
+        val results = PdfTextExtractor.search(_activePagesText.value, query)
+        _searchResults.value = results
+        if (_currentMatchIndex.value >= results.size) {
+            _currentMatchIndex.value = (results.size - 1).coerceAtLeast(0)
         }
     }
 
@@ -436,8 +671,17 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
     fun getPdfEngine(): PdfEngine? = currentEngine
 
     fun closePdf() {
-        if (_isLoading.value) return
-        backgroundTextJob?.cancel()
+        // Closing must work even while a document is still loading: cancel the
+        // in-flight open instead of ignoring the back action entirely.
+        openGeneration++
+        openJob?.cancel()
+        openJob = null
+        _isLoading.value = false
+        _isPendingIntentOpen.value = false
+        extractionJob?.cancel()
+        resetExtractionState()
+        resetTranslationState()
+        currentCacheKey = null
         cancelPassword()
         val currentItem = _activePdfItem.value
         if (currentItem != null) {
@@ -472,7 +716,24 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             }
         }
+        // Translation follows the reader: translate the newly visible page
+        // and its neighbours (cached pages return instantly).
+        if (_isTranslateMode.value) {
+            schedulePageTranslations(page)
+        }
+        // Demand-driven OCR: when the reader lands on pages that have no text
+        // yet and no extraction is running, analyse the new neighbourhood.
+        if (extractionJob?.isActive != true && currentEngine != null) {
+            val needsWork = (page - 3..page + 3).any { p ->
+                p in 0 until (currentItemPageCount()) &&
+                    _activePagesText.value.getOrNull(p)?.words?.isEmpty() != false &&
+                    p !in ocrCheckedPages
+            }
+            if (needsWork) scheduleExtraction(page)
+        }
     }
+
+    private fun currentItemPageCount(): Int = _activePdfItem.value?.pageCount ?: 0
 
     fun jumpToPage(page: Int) {
         val maxPage = (_activePdfItem.value?.pageCount ?: 1) - 1
@@ -548,6 +809,16 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
             if (results.isNotEmpty()) {
                 jumpToPage(results[0].pageIndex)
             }
+            // Make not-yet-analysed pages searchable: native sweep + OCR of the
+            // still-empty pages. Results refresh as pages complete, and the
+            // search UI shows "解析中 n/m" meanwhile instead of a misleading 0件.
+            val pageCount = currentItemPageCount()
+            val hasPending = (0 until pageCount).any { p ->
+                p !in ocrCheckedPages && _activePagesText.value.getOrNull(p)?.words?.isEmpty() != false
+            }
+            if (hasPending) {
+                scheduleExtraction(_currentPage.value, ocrAllPending = true)
+            }
         }
     }
 
@@ -568,15 +839,6 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     // Text Selection
-    fun openTextSelectModal() {
-        _isTextSelectModalOpen.value = true
-    }
-
-    fun closeTextSelectModal() {
-        _isTextSelectModalOpen.value = false
-        _selectedText.value = null
-    }
-
     fun onTextSelected(text: String?) {
         _selectedText.value = if (text.isNullOrBlank()) null else text.trim()
     }

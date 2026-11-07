@@ -25,16 +25,7 @@ class PdfRepository(
 
     val allHistory: Flow<List<PdfItem>> = dao.getAllHistory()
 
-    fun getHistoryByUri(uriString: String): Flow<PdfItem?> = dao.getByUri(uriString)
-
-    /** Result of opening a PDF: the history item, blank per-page text slots, and the file the renderer should open. */
-    data class OpenedPdf(
-        val item: PdfItem,
-        val pages: List<PageText>,
-        val renderFile: File
-    )
-
-    suspend fun openAndRecordPdf(uri: Uri, overrideFileName: String? = null, password: String = ""): OpenedPdf = withContext(Dispatchers.IO) {
+    suspend fun openAndRecordPdf(uri: Uri, overrideFileName: String? = null, password: String = ""): Pair<PdfItem, List<PageText>> = withContext(Dispatchers.IO) {
         val uriString = uri.toString()
         val existingItem = dao.getByUriSync(uriString)
 
@@ -61,24 +52,13 @@ class PdfRepository(
 
         val fileSize = localFile.length()
 
-        // Page count + render source with as little work as possible:
-        // on the common path (no password), probe with the native PdfRenderer
-        // (fast, low memory, no full document parse). Only when a password is
-        // supplied, or the renderer rejects the file (e.g. it is encrypted),
-        // fall back to ONE scratch-backed PDFBox pass that authenticates and,
-        // for encrypted documents, produces the unlocked render copy.
-        var renderFile = localFile
-        val pageCount = if (password.isEmpty()) {
-            probePageCountWithRenderer(localFile) ?: run {
-                val prepared = com.example.pdf.PdfSecurity.prepareDocument(context, localFile, password)
-                renderFile = prepared.renderFile
-                prepared.pageCount
-            }
-        } else {
-            val prepared = com.example.pdf.PdfSecurity.prepareDocument(context, localFile, password)
-            renderFile = prepared.renderFile
-            prepared.pageCount
-        }
+        // Page count comes from PdfRenderer (cheap metadata read). The PDFBox
+        // full parse in PdfSecurity.pageCount is only a fallback for files the
+        // renderer cannot open at all; password authentication itself happens in
+        // PdfEngine/PdfSecurity.prepareForRendering, which only loads PDFBox when
+        // the file actually looks encrypted (or a password was supplied).
+        val pageCount = probePageCountWithRenderer(localFile)
+            ?: com.example.pdf.PdfSecurity.pageCount(context, localFile, password)
         val thumbPath = existingItem?.thumbnailPath
 
         val initialPages = (0 until pageCount).map { i ->
@@ -104,89 +84,7 @@ class PdfRepository(
 
         dao.insert(itemToSave)
 
-        // Thumbnail generation is intentionally NOT launched here: it used to
-        // spin up a second PdfEngine (another full PDFBox parse + renderer)
-        // concurrently with the open, which is exactly the memory spike that
-        // made large files fail to open. The ViewModel generates the thumbnail
-        // afterwards, reusing the already-open engine.
-        OpenedPdf(itemToSave, initialPages, renderFile)
-    }
-
-    /**
-     * Returns the page count using only the native renderer, or null when the
-     * file cannot be opened by it (encrypted, corrupt, unsupported).
-     */
-    private fun probePageCountWithRenderer(file: File): Int? {
-        var pfd: ParcelFileDescriptor? = null
-        var renderer: android.graphics.pdf.PdfRenderer? = null
-        return try {
-            pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-            renderer = android.graphics.pdf.PdfRenderer(pfd)
-            renderer.pageCount
-        } catch (e: Throwable) {
-            Log.d(TAG, "PdfRenderer probe failed; falling back to PDFBox: ${e.message}")
-            null
-        } finally {
-            try { renderer?.close() } catch (_: Exception) {}
-            try { pfd?.close() } catch (_: Exception) {}
-        }
-    }
-
-    suspend fun updateThumbnail(uriString: String, thumbnailPath: String) = withContext(Dispatchers.IO) {
-        dao.updateThumbnail(uriString, thumbnailPath)
-    }
-
-    suspend fun openFromHistory(item: PdfItem): Pair<PdfItem, List<PageText>> = withContext(Dispatchers.IO) {
-        var localFile: File? = item.filePath?.let { File(it) }
-
-        if (localFile == null || !localFile.exists() || localFile.length() == 0L) {
-            val uri = Uri.parse(item.uriString)
-            localFile = try {
-                when (uri.scheme) {
-                    "file" -> File(uri.path ?: "")
-                    else -> PdfEngine.copyUriToLocalCache(context, uri)
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to restore file from URI ${item.uriString}: ${e.message}")
-                localFile
-            }
-        }
-
-        if (localFile == null || !localFile.exists()) {
-            throw IllegalStateException("PDFファイル「${item.fileName}」を開けませんでした。ファイルが移動または削除された可能性があります。")
-        }
-
-        var pageCount = item.pageCount
-        var thumbPath = item.thumbnailPath
-
-        if (pageCount <= 0) {
-            try {
-                val pfd = ParcelFileDescriptor.open(localFile, ParcelFileDescriptor.MODE_READ_ONLY)
-                val renderer = android.graphics.pdf.PdfRenderer(pfd)
-                pageCount = renderer.pageCount
-                renderer.close()
-                pfd.close()
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to probe pageCount in openFromHistory: ${e.message}", e)
-                pageCount = 1
-            }
-        }
-
-        val initialPages = (0 until pageCount).map { i ->
-            PageText(pageIndex = i, fullText = "", paragraphs = emptyList(), lines = emptyList())
-        }
-
-        val updatedItem = item.copy(
-            filePath = localFile.absolutePath,
-            lastViewedTimestamp = System.currentTimeMillis(),
-            pageCount = pageCount,
-            thumbnailPath = thumbPath,
-            fileSizeBytes = localFile.length()
-        )
-
-        dao.insert(updatedItem)
-
-        // Generate thumbnail in background if missing
+        // Defer thumbnail generation to background so it doesn't block PDF opening
         if (thumbPath.isNullOrEmpty() || !File(thumbPath).exists()) {
             kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
                 try {
@@ -194,20 +92,31 @@ class PdfRepository(
                     val generatedThumb = engine.generateAndSaveThumbnail()
                     engine.close()
                     if (!generatedThumb.isNullOrEmpty()) {
-                        dao.updateThumbnail(updatedItem.uriString, generatedThumb)
+                        dao.updateThumbnail(itemToSave.uriString, generatedThumb)
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "Async thumbnail generation in openFromHistory failed: ${e.message}")
-                } catch (e: OutOfMemoryError) {
-                    Log.w(TAG, "Async thumbnail generation in openFromHistory ran out of memory: ${e.message}")
+                    Log.w(TAG, "Async thumbnail generation failed: ${e.message}")
                 }
             }
         }
 
-        Pair(updatedItem, initialPages)
+        Pair(itemToSave, initialPages)
     }
 
-    suspend fun openSamplePdf(): OpenedPdf = withContext(Dispatchers.IO) {
+    /** Cheap page-count probe via PdfRenderer; null when the file cannot be opened that way. */
+    private fun probePageCountWithRenderer(file: File): Int? {
+        if (!file.exists() || file.length() == 0L) return null
+        return try {
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
+                android.graphics.pdf.PdfRenderer(pfd).use { renderer -> renderer.pageCount }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "PdfRenderer page-count probe failed, falling back to PDFBox: ${e.message}")
+            null
+        }
+    }
+
+    suspend fun openSamplePdf(): Pair<PdfItem, List<PageText>> = withContext(Dispatchers.IO) {
         val sampleFile = SamplePdfGenerator.getOrCreateSamplePdf(context)
         val uri = Uri.fromFile(sampleFile)
         openAndRecordPdf(uri, overrideFileName = "Sample_Guide.pdf")
@@ -235,10 +144,56 @@ class PdfRepository(
                 if (f.exists()) f.delete()
             } catch (_: Exception) {}
         }
+        // Also remove the saved_pdfs copy, unless another history entry still
+        // references the same file. Files outside saved_pdfs are the user's own
+        // originals and are never touched.
+        val path = item.filePath
+        if (path != null && isInSavedPdfs(path)) {
+            try {
+                val stillReferenced = dao.getAllHistorySync().any { it.filePath == path }
+                if (!stillReferenced) {
+                    val f = File(path)
+                    if (f.exists()) f.delete()
+                    // Remove the freshness sidecar written by copyUriToLocalCache.
+                    val meta = File(f.parentFile, f.name.removeSuffix(".pdf") + ".meta")
+                    if (meta.exists()) meta.delete()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to delete saved copy $path: ${e.message}")
+            }
+        }
     }
 
     suspend fun clearAllHistory() = withContext(Dispatchers.IO) {
+        // Collect owned files first, then drop the rows.
+        val items = try { dao.getAllHistorySync() } catch (_: Exception) { emptyList() }
         dao.clearAll()
+        for (item in items) {
+            item.thumbnailPath?.let { path ->
+                try {
+                    val f = File(path)
+                    if (f.exists()) f.delete()
+                } catch (_: Exception) {}
+            }
+            val path = item.filePath
+            if (path != null && isInSavedPdfs(path)) {
+                try {
+                    val f = File(path)
+                    if (f.exists()) f.delete()
+                    val meta = File(f.parentFile, f.name.removeSuffix(".pdf") + ".meta")
+                    if (meta.exists()) meta.delete()
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    private fun isInSavedPdfs(path: String): Boolean {
+        val savedDir = File(context.filesDir, "saved_pdfs")
+        return try {
+            File(path).canonicalPath.startsWith(savedDir.canonicalPath + File.separator)
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun getFileNameFromUri(uri: Uri): String? {

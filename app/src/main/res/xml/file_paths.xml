@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <cache-path name="pdf_cache" path="." />
-    <files-path name="pdf_files" path="." />
-    <external-path name="external_files" path="." />
+    <files-path name="pdf_saved" path="saved_pdfs/" />
+    <!-- Sharing only ever targets the app's own saved copies and well-known
+         download locations; do not expose the whole external storage. -->
+    <external-path name="external_downloads" path="Download/" />
 </paths>

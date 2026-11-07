@@ -9,15 +9,35 @@ plugins {
 android {
   namespace = "com.example"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
+  ndkVersion = "27.0.12077973"
 
   defaultConfig {
     applicationId = "com.aistudio.pdfviewer.vtwk"
     minSdk = 24
     targetSdk = 36
-    versionCode = 2
-    versionName = "1.1"
+    versionCode = 4
+    versionName = "1.2.1"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+    // PLaMo translation native engine (llama.cpp), same setup as CircleToSearchlike.
+    ndk {
+      abiFilters += listOf("arm64-v8a")
+    }
+    externalNativeBuild {
+      cmake {
+        arguments += "-DLLAMA_CPP_DIR=${file("../../../llama.cpp").absolutePath}"
+        arguments += "-DFETCHCONTENT_SOURCE_DIR_KLEIDIAI=${file("../../../.tools/kleidiai-src/kleidiai-v1.32.0").absolutePath}"
+        arguments += "-DCMAKE_BUILD_TYPE=Release"
+      }
+    }
+  }
+
+  externalNativeBuild {
+    cmake {
+      path = file("src/main/cpp/CMakeLists.txt")
+      version = "3.22.1"
+    }
   }
 
   signingConfigs {
@@ -96,7 +116,8 @@ dependencies {
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
   implementation(libs.kotlinx.coroutines.play.services)
-  implementation(libs.play.services.mlkit.text.recognition)
+  implementation(libs.mlkit.text.recognition)
+  implementation(libs.mlkit.text.recognition.japanese)
   implementation(libs.pdfbox.android)
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)

@@ -29,12 +29,15 @@ data class PageCacheKey(
 class PdfEngine(
     private val context: Context,
     private val localPdfFile: File,
-    password: String = "",
-    preparedFile: File? = null
+    password: String = ""
 ) : AutoCloseable {
 
     companion object {
         private const val TAG = "PdfEngine"
+
+        /** Hard cap on rendered pixels per page bitmap (~40MB at ARGB_8888). */
+        private const val MAX_BITMAP_PIXELS = 10_000_000L
+        private const val MAX_RENDER_ATTEMPTS = 4
 
         // Dynamic memory-aware LRU Cache
         private val maxMemoryKb = (Runtime.getRuntime().maxMemory() / 1024).toInt()
@@ -87,24 +90,35 @@ class PdfEngine(
 
         fun handleTrimMemory(level: Int) {
             Log.i(TAG, "onTrimMemory triggered with level: $level (current cache size: ${bitmapCache.size() / 1024}MB)")
+            // NOTE: the constants are not ordered by severity across the two families
+            // (RUNNING_* = 5/10/15, UI_HIDDEN = 20, BACKGROUND = 40, MODERATE = 60,
+            // COMPLETE = 80), so each level must be matched explicitly, highest first.
+            // The previous "level >= RUNNING_LOW" branch silently absorbed COMPLETE.
             when {
-                level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL -> {
-                    // Extreme memory pressure - evict all non-critical cached pages immediately
-                    bitmapCache.evictAll()
-                    Log.w(TAG, "Evicted all PDF bitmap caches due to TRIM_MEMORY_RUNNING_CRITICAL")
-                }
-                level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ||
                 level >= ComponentCallbacks2.TRIM_MEMORY_COMPLETE -> {
-                    // Moderate-high pressure: trim cache to 25%
+                    bitmapCache.evictAll()
+                    Log.w(TAG, "Evicted all PDF bitmap caches due to TRIM_MEMORY_COMPLETE")
+                }
+                level >= ComponentCallbacks2.TRIM_MEMORY_MODERATE -> {
                     bitmapCache.trimToSize(defaultCacheCapacityKb / 4)
                     Log.i(TAG, "Trimmed PDF bitmap cache to 25% (${bitmapCache.size() / 1024}MB)")
                 }
-                level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE ||
-                level >= ComponentCallbacks2.TRIM_MEMORY_MODERATE ||
+                level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND ||
                 level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN -> {
-                    // App backgrounded or moderate pressure: trim cache to 50%
                     bitmapCache.trimToSize(defaultCacheCapacityKb / 2)
                     Log.i(TAG, "Trimmed PDF bitmap cache to 50% (${bitmapCache.size() / 1024}MB)")
+                }
+                level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL -> {
+                    bitmapCache.trimToSize(defaultCacheCapacityKb / 4)
+                    Log.i(TAG, "Trimmed PDF bitmap cache to 25% (${bitmapCache.size() / 1024}MB)")
+                }
+                level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW -> {
+                    bitmapCache.trimToSize(defaultCacheCapacityKb / 2)
+                    Log.i(TAG, "Trimmed PDF bitmap cache to 50% (${bitmapCache.size() / 1024}MB)")
+                }
+                level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE -> {
+                    bitmapCache.trimToSize(defaultCacheCapacityKb * 3 / 4)
+                    Log.i(TAG, "Trimmed PDF bitmap cache to 75% (${bitmapCache.size() / 1024}MB)")
                 }
             }
         }
@@ -138,36 +152,67 @@ class PdfEngine(
             }
         }
 
+        // Reference counting for the shared static bitmap cache: with
+        // documentLaunchMode="always" several engines may render the same file,
+        // and one engine closing must not wipe the pages another is displaying.
+        private val openEngineCounts = mutableMapOf<String, Int>()
+
+        @Synchronized
+        fun registerEngine(filePath: String) {
+            openEngineCounts[filePath] = (openEngineCounts[filePath] ?: 0) + 1
+        }
+
+        /** Returns true when this was the last open engine for [filePath]. */
+        @Synchronized
+        fun unregisterEngine(filePath: String): Boolean {
+            val remaining = (openEngineCounts[filePath] ?: 1) - 1
+            if (remaining <= 0) {
+                openEngineCounts.remove(filePath)
+                return true
+            }
+            openEngineCounts[filePath] = remaining
+            return false
+        }
+
         suspend fun copyUriToLocalCache(context: Context, uri: Uri): File = withContext(Dispatchers.IO) {
             val savedDir = File(context.filesDir, "saved_pdfs")
             if (!savedDir.exists()) savedDir.mkdirs()
 
             val hash = md5(uri.toString())
             val targetFile = File(savedDir, "pdf_$hash.pdf")
-            val partFile = File(savedDir, "pdf_$hash.pdf.part")
+            val metaFile = File(savedDir, "pdf_$hash.meta")
 
-            // Reuse an existing copy only when it looks complete. Copies are
-            // written to a ".part" file and renamed into place when finished,
-            // so an interrupted copy (likely for very large files) can never
-            // pose as a complete file. When the provider reports the content
-            // size, also heal partial files left behind by older versions.
+            // Validate a cached copy against the source size (and mtime for file://
+            // URIs) so a replaced document on the provider side is not shadowed
+            // forever by the first copy we made.
+            val sourceSize = querySourceSize(context, uri)
+            val sourceMtime = if (uri.scheme == "file") {
+                uri.path?.let { File(it) }?.takeIf { it.exists() }?.lastModified() ?: -1L
+            } else -1L
+
             if (targetFile.exists() && targetFile.length() > 0L) {
-                val expectedSize = queryContentSize(context, uri)
-                if (expectedSize == null || expectedSize == targetFile.length()) {
+                val cachedMatches = if (sourceSize > 0L) {
+                    targetFile.length() == sourceSize && readMetaLong(metaFile, 0) == sourceSize &&
+                        (sourceMtime <= 0L || readMetaLong(metaFile, 1) == sourceMtime)
+                } else {
+                    // Source size unknown: only trust the cache if we recorded one.
+                    readMetaLong(metaFile, 0) == targetFile.length()
+                }
+                if (cachedMatches) {
                     return@withContext targetFile
                 }
-                Log.w(TAG, "Cached copy size mismatch (have ${targetFile.length()}, expected $expectedSize); re-copying")
+                Log.i(TAG, "Cached copy of $uri is stale (size/mtime changed); re-copying")
             }
 
             // Also check legacy cacheDir
             val legacyCacheDir = File(context.cacheDir, "opened_pdfs")
             val legacyFile = File(legacyCacheDir, "pdf_$hash.pdf")
-            if (legacyFile.exists() && legacyFile.length() > 0L) {
+            if (!targetFile.exists() && legacyFile.exists() && legacyFile.length() > 0L &&
+                (sourceSize <= 0L || legacyFile.length() == sourceSize)
+            ) {
                 try {
-                    legacyFile.inputStream().use { input ->
-                        FileOutputStream(partFile).use { output -> input.copyTo(output, bufferSize = 65536) }
-                    }
-                    movePartIntoPlace(partFile, targetFile)
+                    legacyFile.copyTo(targetFile, overwrite = true)
+                    writeMeta(metaFile, targetFile.length(), sourceMtime)
                     return@withContext targetFile
                 } catch (_: Exception) {
                     return@withContext legacyFile
@@ -175,40 +220,45 @@ class PdfEngine(
             }
 
             context.contentResolver.openInputStream(uri)?.use { input ->
-                FileOutputStream(partFile).use { output ->
+                FileOutputStream(targetFile).use { output ->
                     input.copyTo(output, bufferSize = 65536)
                 }
             } ?: throw IllegalStateException("Could not open input stream from URI: $uri")
-            movePartIntoPlace(partFile, targetFile)
 
+            writeMeta(metaFile, targetFile.length(), sourceMtime)
             targetFile
         }
 
-        private fun movePartIntoPlace(partFile: File, targetFile: File) {
-            if (targetFile.exists()) targetFile.delete()
-            if (!partFile.renameTo(targetFile)) {
-                partFile.copyTo(targetFile, overwrite = true)
-                partFile.delete()
+        private fun querySourceSize(context: Context, uri: Uri): Long {
+            if (uri.scheme == "file") {
+                return uri.path?.let { File(it) }?.takeIf { it.exists() }?.length() ?: -1L
+            }
+            return try {
+                context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    val idx = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                    if (idx != -1 && cursor.moveToFirst() && !cursor.isNull(idx)) cursor.getLong(idx) else -1L
+                } ?: -1L
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not query size for $uri: ${e.message}")
+                -1L
             }
         }
 
-        private fun queryContentSize(context: Context, uri: Uri): Long? {
-            if (uri.scheme != "content") return null
+        private fun readMetaLong(metaFile: File, index: Int): Long {
             return try {
-                context.contentResolver.query(
-                    uri,
-                    arrayOf(android.provider.OpenableColumns.SIZE),
-                    null, null, null
-                )?.use { cursor ->
-                    val idx = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
-                    if (idx != -1 && cursor.moveToFirst() && !cursor.isNull(idx)) {
-                        cursor.getLong(idx)
-                    } else {
-                        null
-                    }
-                }
-            } catch (e: Exception) {
-                null
+                if (!metaFile.exists()) -1L
+                else metaFile.readLines().getOrNull(index)?.trim()?.toLongOrNull() ?: -1L
+            } catch (_: Exception) {
+                -1L
+            }
+        }
+
+        private fun writeMeta(metaFile: File, size: Long, mtime: Long) {
+            try {
+                metaFile.writeText("$size\n$mtime\n")
+            } catch (_: Exception) {
+                // Metadata is only a freshness hint; failing to write it must not
+                // break opening the document.
             }
         }
 
@@ -221,11 +271,7 @@ class PdfEngine(
     private var fileDescriptor: ParcelFileDescriptor? = null
     private var pdfRenderer: PdfRenderer? = null
 
-    // When the caller already prepared the document (PdfSecurity.prepareDocument),
-    // reuse that file instead of running a second full PDFBox parse here.
-    // Ownership: a prepared file different from localPdfFile is deleted by close(),
-    // exactly like a temp file created by prepareForRendering.
-    val file: File = preparedFile ?: PdfSecurity.prepareForRendering(context, localPdfFile, password)
+    val file: File = PdfSecurity.prepareForRendering(context, localPdfFile, password)
     val pageCount: Int
 
     init {
@@ -233,6 +279,7 @@ class PdfEngine(
             fileDescriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
             pdfRenderer = PdfRenderer(fileDescriptor!!)
             pageCount = pdfRenderer?.pageCount ?: 0
+            registerEngine(localPdfFile.absolutePath)
         } catch (error: Throwable) {
             fileDescriptor?.close()
             if (file != localPdfFile) file.delete()
@@ -262,9 +309,6 @@ class PdfEngine(
         return if (cached != null && !cached.isRecycled) cached else null
     }
 
-    /** Upper bound for a single rendered page bitmap (~12M px = ~48MB at ARGB_8888). */
-    private fun maxBitmapPixels(): Int = 12_000_000
-
     suspend fun renderPageBitmap(
         pageIndex: Int,
         targetWidth: Int = 1080,
@@ -279,66 +323,61 @@ class PdfEngine(
 
         val renderer = pdfRenderer ?: return@withContext null
 
-        // Attempt the render; on OutOfMemoryError free the bitmap cache and retry
-        // once with a halved target width instead of crashing the app.
-        // (OutOfMemoryError is an Error, not an Exception, so it must be caught explicitly.)
-        var attemptWidth = targetWidth
-        var lastError: OutOfMemoryError? = null
-        for (attempt in 0..1) {
-            try {
-                val rendered = synchronized(this@PdfEngine) {
-                    renderer.openPage(pageIndex).use { page ->
-                        val originalWidth = page.width
-                        val originalHeight = page.height
+        synchronized(this@PdfEngine) {
+            // OOM-safe rendering: size is chosen from the requested width without a
+            // 1.0 lower bound (small requests may render below the page's point size),
+            // capped by a maximum pixel area, and on OutOfMemoryError the cache is
+            // trimmed and the render retried at progressively lower resolutions.
+            // OutOfMemoryError is an Error, not an Exception, so it must be caught
+            // explicitly or it escapes and crashes the app on large-format pages.
+            var attemptWidth = targetWidth
+            var lastError: Throwable? = null
+            for (attempt in 0 until MAX_RENDER_ATTEMPTS) {
+                try {
+                    return@synchronized renderer.openPage(pageIndex).use { page ->
+                        val originalWidth = page.width.coerceAtLeast(1)
+                        val originalHeight = page.height.coerceAtLeast(1)
 
-                        var scale = (attemptWidth.toFloat() / originalWidth.toFloat())
-                            .coerceAtMost(3.5f)
-                        // Cap the total pixel count: very large-format pages must be
-                        // allowed to scale BELOW 1.0, otherwise createBitmap asks for
-                        // hundreds of MB and throws OutOfMemoryError.
-                        val pixelsAtScale = originalWidth.toLong() * originalHeight *
-                            scale.toDouble() * scale.toDouble()
-                        if (pixelsAtScale > maxBitmapPixels()) {
-                            val capScale = kotlin.math.sqrt(
-                                maxBitmapPixels().toDouble() /
-                                    (originalWidth.toDouble() * originalHeight.toDouble())
-                            ).toFloat()
-                            scale = minOf(scale, capScale)
-                        }
-                        scale = scale.coerceAtLeast(0.05f)
+                        var scale = attemptWidth.toFloat() / originalWidth.toFloat()
+                        val areaScale = kotlin.math.sqrt(
+                            MAX_BITMAP_PIXELS.toDouble() / (originalWidth.toDouble() * originalHeight.toDouble())
+                        ).toFloat()
+                        if (scale > areaScale) scale = areaScale
+                        if (scale <= 0f || scale.isNaN()) scale = 0.1f
 
                         val width = (originalWidth * scale).toInt().coerceAtLeast(1)
                         val height = (originalHeight * scale).toInt().coerceAtLeast(1)
 
                         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                        // Pre-fill with clean white background
-                        bitmap.eraseColor(Color.WHITE)
+                        try {
+                            // Pre-fill with clean white background
+                            bitmap.eraseColor(Color.WHITE)
+                            page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        } catch (t: Throwable) {
+                            if (!bitmap.isRecycled) bitmap.recycle()
+                            throw t
+                        }
 
-                        page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        bitmapCache.put(cacheKey, bitmap)
                         bitmap
                     }
+                } catch (e: OutOfMemoryError) {
+                    lastError = e
+                    Log.w(TAG, "OOM rendering page $pageIndex at width $attemptWidth (attempt $attempt); trimming cache and retrying smaller", e)
+                    bitmapCache.trimToSize(defaultCacheCapacityKb / 4)
+                    System.gc()
+                    attemptWidth = (attemptWidth * 0.6f).toInt().coerceAtLeast(240)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error rendering page $pageIndex: ${e.message}", e)
+                    return@synchronized null
+                } catch (e: Error) {
+                    Log.e(TAG, "Fatal error rendering page $pageIndex: ${e.message}", e)
+                    return@synchronized null
                 }
-                if (attemptWidth == targetWidth) {
-                    bitmapCache.put(cacheKey, rendered)
-                } else {
-                    bitmapCache.put(
-                        PageCacheKey(localPdfFile.absolutePath, pageIndex, attemptWidth),
-                        rendered
-                    )
-                }
-                return@withContext rendered
-            } catch (e: OutOfMemoryError) {
-                lastError = e
-                Log.e(TAG, "Out of memory rendering page $pageIndex (attempt $attempt, width $attemptWidth); evicting cache and retrying smaller", e)
-                bitmapCache.evictAll()
-                attemptWidth = (attemptWidth / 2).coerceAtLeast(360)
-            } catch (e: Exception) {
-                Log.e(TAG, "Error rendering page $pageIndex: ${e.message}", e)
-                return@withContext null
             }
+            Log.e(TAG, "Giving up rendering page $pageIndex after retries: ${lastError?.message}")
+            null
         }
-        Log.e(TAG, "Giving up rendering page $pageIndex after OOM retries: ${lastError?.message}")
-        null
     }
 
     suspend fun generateAndSaveThumbnail(): String? = withContext(Dispatchers.IO) {
@@ -372,9 +411,8 @@ class PdfEngine(
             } catch (e: Exception) {
                 Log.e(TAG, "Error generating thumbnail: ${e.message}", e)
                 null
-            } catch (e: OutOfMemoryError) {
-                Log.e(TAG, "Out of memory generating thumbnail: ${e.message}", e)
-                bitmapCache.evictAll()
+            } catch (e: Error) {
+                Log.e(TAG, "Fatal error generating thumbnail: ${e.message}", e)
                 null
             }
         }
@@ -382,7 +420,11 @@ class PdfEngine(
 
     @Synchronized
     override fun close() {
-        clearCacheForFile(localPdfFile.absolutePath)
+        // Only drop the shared bitmap cache when no other engine instance is
+        // still showing the same file in another task/activity.
+        if (unregisterEngine(localPdfFile.absolutePath)) {
+            clearCacheForFile(localPdfFile.absolutePath)
+        }
         if (file != localPdfFile) file.delete()
         try {
             pdfRenderer?.close()
