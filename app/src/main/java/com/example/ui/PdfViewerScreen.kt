@@ -179,6 +179,7 @@ fun PdfViewerScreen(
     onToggleTranslateMode: (Boolean) -> Unit = {},
     pageTranslations: Map<Int, List<com.example.pdf.TranslatedBlock>> = emptyMap(),
     translatingPages: Set<Int> = emptySet(),
+    pageTranslationProgress: Map<Int, Pair<Int, Int>> = emptyMap(),
     availableShareApps: List<LastSharedApp> = emptyList(),
     onSaveWithoutPassword: () -> Unit = {},
     modifier: Modifier = Modifier
@@ -336,6 +337,7 @@ fun PdfViewerScreen(
                         showTranslateUnsupportedNotice = isTranslateMode && extractionProgress == null &&
                             pageText != null && !pageText.isNativeTextLayer,
                         isTranslatingPage = pageIndex in translatingPages,
+                        translationProgress = pageTranslationProgress[pageIndex],
                         searchHighlightIndices = if (currentSearchMatch?.pageIndex == pageIndex) searchHighlightIndices else emptySet(),
                         selectedWordIndices = if (activeSelectedPage == pageIndex) activeSelectedWordIndices else emptySet(),
                         onWordsSelected = { wordIndices, text ->
@@ -834,6 +836,7 @@ fun PdfPageItem(
     translatedBlocks: List<com.example.pdf.TranslatedBlock> = emptyList(),
     showTranslateUnsupportedNotice: Boolean = false,
     isTranslatingPage: Boolean = false,
+    translationProgress: Pair<Int, Int>? = null,
     searchHighlightIndices: Set<Int> = emptySet(),
     selectedWordIndices: Set<Int>,
     onWordsSelected: (Set<Int>, String) -> Unit,
@@ -1049,14 +1052,20 @@ fun PdfPageItem(
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
                     )
                 }
-            } else if (isTranslatingPage && translatedBlocks.isEmpty()) {
+            } else if (translationProgress != null || (isTranslatingPage && translatedBlocks.isEmpty())) {
+                // Visible the whole time translation is running (not only
+                // before the first block lands) so a long page never looks
+                // like it stopped halfway through.
+                val label = translationProgress?.let { (done, total) ->
+                    "翻訳中… $done/$total"
+                } ?: "翻訳中…"
                 Surface(
                     shape = RoundedCornerShape(8.dp),
                     color = Color(0x992B2D30),
                     modifier = Modifier.align(Alignment.TopEnd).padding(8.dp)
                 ) {
                     Text(
-                        text = "翻訳中…",
+                        text = label,
                         style = MaterialTheme.typography.labelMedium,
                         color = Color.White,
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
