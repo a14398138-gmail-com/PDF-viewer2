@@ -58,7 +58,17 @@ jobs:
             keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
           fi
 
+      - name: Checkout llama.cpp (native translation engine)
+        # Pinned release so the native API used by app/src/main/cpp/llama_jni.cpp
+        # cannot drift. The Gradle build only enables the native engine when
+        # this checkout exists; without it the APK ships without
+        # libplamo_llama.so and translation fails at runtime with an
+        # UnsatisfiedLinkError.
+        run: git clone --depth 1 --branch v0.9.0 https://github.com/ggml-org/llama.cpp llama.cpp
+
       - name: Build Debug APK
+        env:
+          LLAMA_CPP_DIR: ${{ github.workspace }}/llama.cpp
         run: gradle :app:testDebugUnitTest :app:assembleDebug --stacktrace
 
       - name: Upload Debug APK Artifact
