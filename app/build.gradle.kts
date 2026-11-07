@@ -20,23 +20,46 @@ android {
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-    // PLaMo translation native engine (llama.cpp), same setup as CircleToSearchlike.
-    ndk {
-      abiFilters += listOf("arm64-v8a")
-    }
-    externalNativeBuild {
-      cmake {
-        arguments += "-DLLAMA_CPP_DIR=${file("../../../llama.cpp").absolutePath}"
-        arguments += "-DFETCHCONTENT_SOURCE_DIR_KLEIDIAI=${file("../../../.tools/kleidiai-src/kleidiai-v1.32.0").absolutePath}"
-        arguments += "-DCMAKE_BUILD_TYPE=Release"
+    val llamaCppDir = System.getenv("LLAMA_CPP_DIR")?.let { file(it) }
+        ?: listOf(
+            file("../../../llama.cpp"),
+            file("../../llama.cpp"),
+            file("../llama.cpp"),
+            file("llama.cpp")
+        ).firstOrNull { it.exists() }
+
+    // PLaMo translation native engine (llama.cpp) enabled when llama.cpp source is available.
+    if (llamaCppDir != null && llamaCppDir.exists()) {
+      ndk {
+        abiFilters += listOf("arm64-v8a")
+      }
+      externalNativeBuild {
+        cmake {
+          arguments += "-DLLAMA_CPP_DIR=${llamaCppDir.absolutePath}"
+          val kleidiDir = file("../../../.tools/kleidiai-src/kleidiai-v1.32.0")
+          if (kleidiDir.exists()) {
+            arguments += "-DFETCHCONTENT_SOURCE_DIR_KLEIDIAI=${kleidiDir.absolutePath}"
+          }
+          arguments += "-DCMAKE_BUILD_TYPE=Release"
+        }
       }
     }
   }
 
-  externalNativeBuild {
-    cmake {
-      path = file("src/main/cpp/CMakeLists.txt")
-      version = "3.22.1"
+  val llamaCppSource = System.getenv("LLAMA_CPP_DIR")?.let { file(it) }
+      ?: listOf(
+          file("../../../llama.cpp"),
+          file("../../llama.cpp"),
+          file("../llama.cpp"),
+          file("llama.cpp")
+      ).firstOrNull { it.exists() }
+
+  if (llamaCppSource != null && llamaCppSource.exists()) {
+    externalNativeBuild {
+      cmake {
+        path = file("src/main/cpp/CMakeLists.txt")
+        version = "3.22.1"
+      }
     }
   }
 
