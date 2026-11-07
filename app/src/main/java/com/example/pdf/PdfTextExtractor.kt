@@ -286,7 +286,7 @@ object PdfTextExtractor {
      * page width) keeps word spacing intact while real column gutters
      * still split.
      */
-    fun segmentWordsByHorizontalGap(words: List<ExtractedWord>): List<List<ExtractedWord>> {
+    internal fun segmentWordsByHorizontalGap(words: List<ExtractedWord>): List<List<ExtractedWord>> {
         if (words.isEmpty()) return emptyList()
         val sorted = words.sortedBy { it.relX }
         val segments = mutableListOf<MutableList<ExtractedWord>>()
