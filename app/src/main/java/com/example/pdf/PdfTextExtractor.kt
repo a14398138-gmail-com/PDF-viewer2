@@ -683,7 +683,12 @@ object PdfTextExtractor {
 
                 // 行またぎであっても改行を挿入せず、自然な文章として連結
                 if (prev.text.endsWith("-") && !isPrevCjk && !isCurCjk) {
-                    // 単語末尾のハイフン（例: "blue-light-" + "mediated" -> "blue-light-mediated"）は空白を挟まず連結
+                    if (!prev.text.dropLast(1).contains('-')) {
+                        // 単語末尾のハイフンによる行またぎ（例: "inter-" + "national" -> "international"）を結合
+                        sb.setLength(sb.length - 1)
+                    } else {
+                        // 複合語ハイフン（例: "blue-light-" + "mediated" -> "blue-light-mediated"）はハイフンを維持
+                    }
                 } else if (!isPrevCjk && !isCurCjk) {
                     // 英数字・欧文単語間のスペース
                     sb.append(" ")

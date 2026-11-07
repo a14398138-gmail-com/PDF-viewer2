@@ -40,7 +40,18 @@ jobs:
         run: |
           touch .env
           if [ -n "$DEBUG_KEYSTORE_BASE64" ]; then
-            echo "$DEBUG_KEYSTORE_BASE64" | base64 -d > debug.keystore
+            # Secrets pasted via the GitHub UI often carry surrounding
+            # whitespace/newlines or a data-URI style prefix; strip them
+            # before decoding.
+            CLEAN=$(printf '%s' "$DEBUG_KEYSTORE_BASE64" | tr -d ' \t\r\n' | sed -e 's#^data:.*;base64,##' -e 's#^base64,##')
+            if printf '%s' "$CLEAN" | base64 -d > debug.keystore 2>/dev/null \
+               && [ -s debug.keystore ] \
+               && keytool -list -keystore debug.keystore -storepass android >/dev/null 2>&1; then
+              echo "Using keystore from DEBUG_KEYSTORE_BASE64."
+            else
+              echo "::error::DEBUG_KEYSTORE_BASE64 could not be decoded into a valid keystore (storepass android). Re-create it with: base64 -w0 debug.keystore"
+              exit 1
+            fi
           elif [ -f "debug.keystore.base64" ]; then
             base64 -d debug.keystore.base64 > debug.keystore
           else
