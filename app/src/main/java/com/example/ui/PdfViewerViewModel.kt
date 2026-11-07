@@ -466,6 +466,15 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
     private val _translatingPages = MutableStateFlow<Set<Int>>(emptySet())
     val translatingPages: StateFlow<Set<Int>> = _translatingPages.asStateFlow()
 
+    /** Per-page translation progress: translated block count to total blocks. */
+    private val _pageTranslationProgress = MutableStateFlow<Map<Int, Pair<Int, Int>>>(emptyMap())
+    val pageTranslationProgress: StateFlow<Map<Int, Pair<Int, Int>>> =
+        _pageTranslationProgress.asStateFlow()
+
+    /** In-flight page translation jobs, for cancellation when the focus page moves. */
+    private val activeTranslationJobs = java.util.concurrent.ConcurrentHashMap<Int, kotlinx.coroutines.Job>()
+    private var neighbourSchedulerJob: kotlinx.coroutines.Job? = null
+
     private val _showTranslateModelSetup = MutableStateFlow(false)
     val showTranslateModelSetup: StateFlow<Boolean> = _showTranslateModelSetup.asStateFlow()
 
@@ -477,16 +486,26 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
 
     private val claimedTranslationPages = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
 
+    private fun cancelActiveTranslationJobs() {
+        neighbourSchedulerJob?.cancel()
+        neighbourSchedulerJob = null
+        activeTranslationJobs.values.forEach { it.cancel() }
+        activeTranslationJobs.clear()
+    }
+
     private fun resetTranslationState() {
         _isTranslateMode.value = false
+        cancelActiveTranslationJobs()
         _pageTranslations.value = emptyMap()
         _translatingPages.value = emptySet()
+        _pageTranslationProgress.value = emptyMap()
         claimedTranslationPages.clear()
     }
 
     fun setTranslateMode(on: Boolean) {
         if (!on) {
             _isTranslateMode.value = false
+            cancelActiveTranslationJobs()
             return
         }
         if (!translateController.modelExists()) {
@@ -561,18 +580,30 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
             .filter { it in 0 until pageCount }
             .distinct()
         val focus = order.firstOrNull() ?: return
+        // The focus page must get the engine next: cancel jobs for pages that
+        // are no longer in the visit order. A running native call cannot be
+        // interrupted, but the job ends right after it returns and its partial
+        // results stay published and cached, so a later visit resumes where it
+        // stopped instead of competing for the engine with the visible page.
+        neighbourSchedulerJob?.cancel()
+        activeTranslationJobs.keys.filter { it !in order }.forEach { page ->
+            activeTranslationJobs.remove(page)?.cancel()
+        }
         val focusJob = viewModelScope.launch(Dispatchers.Default) {
             translatePageInternal(focus)
         }
+        activeTranslationJobs[focus] = focusJob
         val neighbours = order.drop(1)
         if (neighbours.isNotEmpty()) {
-            viewModelScope.launch {
+            neighbourSchedulerJob = viewModelScope.launch {
                 focusJob.join()
                 for (page in neighbours) {
+                    if (!_isTranslateMode.value) return@launch
                     if (page in claimedTranslationPages) continue
-                    viewModelScope.launch(Dispatchers.Default) {
+                    val job = viewModelScope.launch(Dispatchers.Default) {
                         translatePageInternal(page)
                     }
+                    activeTranslationJobs[page] = job
                 }
             }
         }
@@ -632,12 +663,18 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                 if (results.isNotEmpty()) {
                     _pageTranslations.value = _pageTranslations.value + (pageIdx to results.toList())
                 }
+                _pageTranslationProgress.value =
+                    _pageTranslationProgress.value + (pageIdx to Pair(results.size, blocks.size))
             }
 
             fun accept(block: com.example.pdf.TextBlock, translatedText: String) {
                 results.add(TranslatedBlock(block, translatedText))
                 pendingSaves[block.blockIndex] = block.text to translatedText
             }
+
+            // Show 0/N right away so the page advertises that translation is
+            // in progress before the first block lands.
+            publish()
 
             // Group consecutive uncached blocks (same direction, joined
             // length within the batch cap) so several blocks share one
@@ -702,7 +739,9 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                         }
                     }
                     publish()
+                    if (failed) break
                 }
+                if (failed) break
                 i = segEnd
             }
             completed = !failed && results.isNotEmpty()
@@ -723,6 +762,8 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             }
             _translatingPages.value = _translatingPages.value - pageIdx
+            _pageTranslationProgress.value = _pageTranslationProgress.value - pageIdx
+            activeTranslationJobs.remove(pageIdx)
             if (!completed) {
                 // Allow a later visit to retry unfinished pages.
                 claimedTranslationPages.remove(pageIdx)

@@ -40,7 +40,10 @@ class TranslateController(context: Context) {
                 return@withContext LoadResult.Error("ライブラリ読込失敗: ${LlamaEngine.libraryError}")
             }
             val h = try {
-                sharedEngine.nativeLoad(modelFile.absolutePath, 6, 4096)
+                // Use the big cores the device has (phones ship 6-8); the
+                // previous fixed 6 left free cores unused on 8-core devices.
+                val threads = Runtime.getRuntime().availableProcessors().coerceIn(4, 8)
+                sharedEngine.nativeLoad(modelFile.absolutePath, threads, 4096)
             } catch (t: Throwable) {
                 -1L
             }

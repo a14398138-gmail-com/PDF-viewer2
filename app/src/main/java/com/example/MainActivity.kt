@@ -163,6 +163,7 @@ fun PdfApp(
     val isTranslateMode by viewModel.isTranslateMode.collectAsStateWithLifecycle()
     val pageTranslations by viewModel.pageTranslations.collectAsStateWithLifecycle()
     val translatingPages by viewModel.translatingPages.collectAsStateWithLifecycle()
+    val pageTranslationProgress by viewModel.pageTranslationProgress.collectAsStateWithLifecycle()
     val showTranslateModelSetup by viewModel.showTranslateModelSetup.collectAsStateWithLifecycle()
     val translateDownloadProgress by viewModel.translateDownloadProgress.collectAsStateWithLifecycle()
     val isTranslateModelLoading by viewModel.isTranslateModelLoading.collectAsStateWithLifecycle()
@@ -345,6 +346,7 @@ fun PdfApp(
                             onToggleTranslateMode = { viewModel.setTranslateMode(it) },
                             pageTranslations = pageTranslations,
                             translatingPages = translatingPages,
+                            pageTranslationProgress = pageTranslationProgress,
                             onPageTextRecognized = { pageIdx, text -> viewModel.updatePageText(pageIdx, text) },
                             onSaveWithoutPassword = {
                                 savePdfLauncher.launch(currentItem.fileName.substringBeforeLast('.', currentItem.fileName) + "_unlocked.pdf")
