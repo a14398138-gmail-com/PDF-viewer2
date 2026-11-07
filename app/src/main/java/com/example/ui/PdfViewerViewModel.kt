@@ -617,7 +617,7 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
         val separator = if (tgt == "ja") "" else " "
         val translated = StringBuilder()
         for (chunk in PdfBlockExtractor.splitIntoChunks(blockText)) {
-            when (val r = translateController.translateStream(chunk, src, tgt) {}) {
+            when (val r = translateStreamWithRetry(chunk, src, tgt)) {
                 is TranslateController.TranslateResult.Ok -> {
                     if (translated.isNotEmpty()) translated.append(separator)
                     translated.append(r.text)
@@ -629,6 +629,26 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }
         return translated.toString().trim().ifEmpty { null }
+    }
+
+    /**
+     * [TranslateController.translateStream] with one transparent retry: a
+     * single failed request used to abort the whole page's translation with
+     * no retry, leaving the page permanently half-translated while the
+     * translate mode stayed on. Reloads the model first (a no-op when it is
+     * still loaded) so an evicted or crashed engine recovers instead of
+     * failing every following block.
+     */
+    private suspend fun translateStreamWithRetry(
+        text: String,
+        src: String,
+        tgt: String
+    ): TranslateController.TranslateResult {
+        val first = translateController.translateStream(text, src, tgt) {}
+        if (first is TranslateController.TranslateResult.Ok) return first
+        val reload = translateController.loadModel()
+        if (reload is TranslateController.LoadResult.Error) return first
+        return translateController.translateStream(text, src, tgt) {}
     }
 
     private suspend fun translatePageInternal(pageIdx: Int) {
@@ -714,7 +734,7 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                         if (t == null) failed = true else accept(run.first(), t)
                     } else {
                         val joined = TranslationBatch.join(run.map { it.text })
-                        when (val r = translateController.translateStream(joined, src, tgt) {}) {
+                        when (val r = translateStreamWithRetry(joined, src, tgt)) {
                             is TranslateController.TranslateResult.Ok -> {
                                 val parts = TranslationBatch.split(r.text, run.size)
                                 if (parts != null) {
