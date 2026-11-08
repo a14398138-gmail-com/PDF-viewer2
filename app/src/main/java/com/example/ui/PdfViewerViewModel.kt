@@ -19,8 +19,10 @@ import com.example.translate.TranslateController
 import com.example.ui.theme.ThemeMode
 import com.example.util.LastShareAppManager
 import com.example.util.LastSharedApp
+import android.os.SystemClock
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -32,6 +34,9 @@ import java.io.File
 
 /** Extraction progress for the search UI: pages fully analysed out of [total]. */
 data class ExtractionProgress(val done: Int, val total: Int)
+
+/** Minimum spacing between batched publications of background-extracted pages. */
+private const val EXTRACTION_PUBLISH_INTERVAL_MS = 300L
 
 class PdfViewerViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -183,6 +188,13 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
             try {
                 val (item, extractedPages) = repository.openAndRecordPdf(uri, password = password ?: "")
                 val source = File(requireNotNull(item.filePath))
+                // The text-cache key is a SHA-256 over the whole file. It used to
+                // be computed before the first page was rendered; it now runs in
+                // parallel with engine creation and the first render (and is
+                // memoized per file, so reopening skips it).
+                val cacheKeyDeferred = async(Dispatchers.IO) {
+                    try { PdfTextCache.keyFor(getApplication(), source) } catch (_: Exception) { null }
+                }
                 val engine = withContext(Dispatchers.IO) {
                     PdfEngine(getApplication(), source, password ?: "")
                 }
@@ -197,13 +209,11 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                 currentEngine?.close()
                 currentEngine = engine
                 newEngine = null
-                currentCacheKey = withContext(Dispatchers.IO) {
-                    try { PdfTextCache.keyFor(source) } catch (_: Exception) { null }
-                }
+                currentCacheKey = null
                 resetExtractionState()
                 resetTranslationState()
                 val targetPage = item.lastOpenedPage.coerceIn(0, (item.pageCount - 1).coerceAtLeast(0))
-                engine.renderPageBitmap(targetPage)
+                prerenderForDisplay(engine, targetPage)
                 _activePdfItem.value = item
                 _activePagesText.value = extractedPages
                 _currentPage.value = targetPage
@@ -211,6 +221,13 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                 closeSearch()
                 _selectedText.value = null
                 cancelPassword()
+                startPageDimensionPreload(engine)
+                // The page is on screen; release the loading state before
+                // waiting for the content hash that text extraction needs.
+                _isPendingIntentOpen.value = false
+                _isLoading.value = false
+                currentCacheKey = cacheKeyDeferred.await()
+                if (generation != openGeneration || currentEngine !== engine) return@launch
                 scheduleExtraction(targetPage)
             } catch (e: com.tom_roush.pdfbox.pdmodel.encryption.InvalidPasswordException) {
                 if (generation == openGeneration) {
@@ -295,13 +312,14 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                     }
                     currentEngine = engine
                     currentCacheKey = withContext(Dispatchers.IO) {
-                        try { PdfTextCache.keyFor(file) } catch (_: Exception) { null }
+                        try { PdfTextCache.keyFor(getApplication(), file) } catch (_: Exception) { null }
                     }
                     resetExtractionState()
                     resetTranslationState()
 
                     // Pre-render page 0 immediately
-                    engine.renderPageBitmap(0)
+                    prerenderForDisplay(engine, 0)
+                    startPageDimensionPreload(engine)
 
                     _activePdfItem.value = item
                     _activePagesText.value = extractedPages
@@ -323,6 +341,32 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    /**
+     * Renders [page] at exactly the width the page composable will request,
+     * so the bitmap is already in the cache when the viewer appears. (The old
+     * pre-render used the default 1080px while the viewer asks for
+     * 1.5x screen width: a wasted render on the critical path.)
+     */
+    private suspend fun prerenderForDisplay(engine: PdfEngine, page: Int) {
+        val width = PdfEngine.displayTargetWidth(PdfEngine.screenWidthPx(getApplication()), 1f)
+        engine.renderPageBitmap(page, targetWidth = width)
+    }
+
+    private var dimensionPreloadJob: Job? = null
+
+    private fun startPageDimensionPreload(engine: PdfEngine) {
+        dimensionPreloadJob?.cancel()
+        dimensionPreloadJob = viewModelScope.launch {
+            try {
+                engine.preloadPageDimensions()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                android.util.Log.w("PdfViewerViewModel", "Page size preload stopped: ${e.message}")
+            }
+        }
+    }
+
     // ---- Demand-driven text extraction -------------------------------------
     // Phase 1: the visible page ±3, with OCR fallback (what the user is reading).
     // Phase 2: every remaining page, native text only (cheap; makes search
@@ -337,7 +381,11 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
     private val ocrCheckedPages = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
     @Volatile private var searchOcrActive = false
 
+    /** Bumped whenever the extraction state is reset (document opened/closed). */
+    @Volatile private var extractionGeneration = 0
+
     private fun resetExtractionState() {
+        extractionGeneration++
         nativeCheckedPages.clear()
         ocrCheckedPages.clear()
         searchOcrActive = false
@@ -352,13 +400,33 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
         if (ocrAllPending) searchOcrActive = true
         val cacheKey = currentCacheKey
         val renderFile = engine.file
+        val generation = extractionGeneration
 
-        extractionJob?.cancel()
+        val previousJob = extractionJob
+        previousJob?.cancel()
         extractionJob = viewModelScope.launch(Dispatchers.Default) {
+            // A superseded run publishes what it already extracted from its
+            // finally block; start from that state, not from a stale snapshot
+            // (its pages are already marked as checked and would never be
+            // extracted again).
+            previousJob?.join()
+
             // Give UI immediate rendering priority for the first frame
             kotlinx.coroutines.delay(80)
 
-            val session = if (renderFile.exists()) PdfTextExtractor.openSession(renderFile) else null
+            // PDFBox parses the whole document when it is loaded, so the session
+            // is opened only once a page actually needs native extraction: a
+            // document whose pages are all in the disk cache never loads it.
+            var session: com.example.pdf.PdfTextExtractionSession? = null
+            var sessionOpened = false
+            fun nativeSession(): com.example.pdf.PdfTextExtractionSession? {
+                if (!sessionOpened) {
+                    sessionOpened = true
+                    session = if (renderFile.exists()) PdfTextExtractor.openSession(renderFile) else null
+                }
+                return session
+            }
+
             val list = _activePagesText.value.toMutableList()
             while (list.size < pageCount) {
                 list.add(PageText(pageIndex = list.size, fullText = ""))
@@ -374,7 +442,36 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                     if (settled >= pageCount) null else ExtractionProgress(settled, pageCount)
             }
 
-            suspend fun process(pageIdx: Int, allowOcr: Boolean) {
+            // Publishing copies the page list, recounts progress over every
+            // page, re-runs the active search and recomposes the viewer. Doing
+            // that after every page made the background sweep O(n^2) and fired
+            // hundreds of recompositions in a row (e.g. reopening a cached
+            // 300-page PDF). Pages around the reader are still published
+            // immediately; the rest are published in batches.
+            var listChanged = false
+            var pendingPublish = false
+            var lastPublishAt = 0L
+
+            fun flush() {
+                if (!pendingPublish) return
+                pendingPublish = false
+                lastPublishAt = SystemClock.uptimeMillis()
+                if (listChanged) {
+                    listChanged = false
+                    _activePagesText.value = list.toList()
+                }
+                publishProgress()
+                refreshSearchResults()
+            }
+
+            fun publish(immediate: Boolean) {
+                pendingPublish = true
+                if (immediate || SystemClock.uptimeMillis() - lastPublishAt >= EXTRACTION_PUBLISH_INTERVAL_MS) {
+                    flush()
+                }
+            }
+
+            suspend fun process(pageIdx: Int, allowOcr: Boolean, immediate: Boolean) {
                 if (list[pageIdx].words.isNotEmpty() && pageIdx in nativeCheckedPages) return
                 // 0. Disk cache first.
                 if (cacheKey != null && pageIdx !in nativeCheckedPages) {
@@ -385,57 +482,54 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
                         nativeCheckedPages.add(pageIdx)
                         ocrCheckedPages.add(pageIdx)
                         list[pageIdx] = cached
-                        _activePagesText.value = list.toList()
-                        publishProgress()
-                        refreshSearchResults()
+                        listChanged = true
+                        publish(immediate)
                         return
                     }
                 }
                 // 1. Native text layer.
                 var pageText: PageText? = null
                 if (pageIdx !in nativeCheckedPages) {
-                    pageText = session?.extractNativeText(pageIdx)
+                    pageText = nativeSession()?.extractNativeText(pageIdx)
                     nativeCheckedPages.add(pageIdx)
                 }
-                // 2. OCR fallback (only where allowed).
+                // 2. OCR fallback (only where allowed). Reuses the bitmap already
+                // rendered for display when there is one.
                 if ((pageText == null || pageText.words.isEmpty()) && allowOcr && pageIdx !in ocrCheckedPages) {
-                    val bitmap = engine.renderPageBitmap(pageIdx, targetWidth = 1080)
-                    if (bitmap != null) {
-                        pageText = PdfTextExtractor.extractPageFromBitmap(bitmap, pageIdx)
-                    }
+                    pageText = engine.withOcrBitmap(pageIdx, minWidth = 1080) { bitmap ->
+                        PdfTextExtractor.extractPageFromBitmap(bitmap, pageIdx)
+                    } ?: pageText
                     ocrCheckedPages.add(pageIdx)
                 }
                 if (pageText != null) {
                     list[pageIdx] = pageText
+                    listChanged = true
                     if (pageText.words.isNotEmpty() && cacheKey != null) {
                         withContext(Dispatchers.IO) {
                             PdfTextCache.savePage(getApplication(), cacheKey, pageText)
                         }
                     }
                 }
-                _activePagesText.value = list.toList()
-                publishProgress()
-                refreshSearchResults()
+                publish(immediate)
             }
 
             try {
-                session.use {
-                    // Phase 1: focus window with OCR.
-                    for (delta in 0..3) {
-                        for (p in listOf(focusPage + delta, focusPage - delta)) {
-                            if (p in 0 until pageCount) process(p, allowOcr = true)
-                        }
+                // Phase 1: focus window with OCR, published page by page.
+                for (delta in 0..3) {
+                    for (p in listOf(focusPage + delta, focusPage - delta)) {
+                        if (p in 0 until pageCount) process(p, allowOcr = true, immediate = true)
                     }
-                    // Phase 2: remaining pages, native text only.
+                }
+                // Phase 2: remaining pages, native text only (batched).
+                for (p in 0 until pageCount) {
+                    if (p !in nativeCheckedPages) process(p, allowOcr = false, immediate = false)
+                }
+                // Phase 3: search-driven OCR of still-empty pages. Each page is
+                // slow, so each result is published as soon as it is ready.
+                if (searchOcrActive) {
                     for (p in 0 until pageCount) {
-                        if (p !in nativeCheckedPages) process(p, allowOcr = false)
-                    }
-                    // Phase 3: search-driven OCR of still-empty pages.
-                    if (searchOcrActive) {
-                        for (p in 0 until pageCount) {
-                            if (p !in ocrCheckedPages && list[p].words.isEmpty()) {
-                                process(p, allowOcr = true)
-                            }
+                        if (p !in ocrCheckedPages && list[p].words.isEmpty()) {
+                            process(p, allowOcr = true, immediate = true)
                         }
                     }
                 }
@@ -444,7 +538,16 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
             } catch (e: Exception) {
                 android.util.Log.w("PdfViewerViewModel", "Text extraction interrupted: ${e.message}")
             } finally {
-                publishProgress()
+                try {
+                    session?.close()
+                } catch (_: Exception) {
+                }
+                // Never drop extracted-but-unpublished pages (also on
+                // cancellation), unless the document has been closed/replaced.
+                if (generation == extractionGeneration) {
+                    pendingPublish = true
+                    flush()
+                }
             }
         }
     }
@@ -643,11 +746,14 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
         src: String,
         tgt: String
     ): TranslateController.TranslateResult {
-        val first = translateController.translateStream(text, src, tgt) {}
+        // No partial-result callback: nothing consumes it here, and passing one
+        // made the native loop call back into the JVM (plus a full-string
+        // copy) for every generated token.
+        val first = translateController.translateStream(text, src, tgt)
         if (first is TranslateController.TranslateResult.Ok) return first
         val reload = translateController.loadModel()
         if (reload is TranslateController.LoadResult.Error) return first
-        return translateController.translateStream(text, src, tgt) {}
+        return translateController.translateStream(text, src, tgt)
     }
 
     private suspend fun translatePageInternal(pageIdx: Int) {
@@ -795,6 +901,7 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
         _isLoading.value = false
         _isPendingIntentOpen.value = false
         extractionJob?.cancel()
+        dimensionPreloadJob?.cancel()
         resetExtractionState()
         resetTranslationState()
         currentCacheKey = null

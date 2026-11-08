@@ -849,8 +849,26 @@ fun PdfPageItem(
     val config = LocalConfiguration.current
     val screenWidthPx = with(density) { config.screenWidthDp.dp.roundToPx() }
 
-    val pageDimensions = remember(pdfEngine, pageIndex) {
-        pdfEngine?.getPageDimensions(pageIndex) ?: Pair(595, 842)
+    // Never measure the page on the main thread: getPageDimensions() waits for
+    // the engine lock, which a background render holds for its whole duration,
+    // so composing a page while another one rendered stalled scrolling. The
+    // size comes from the engine's cache (pre-measured after opening), with
+    // the first page's size as placeholder until it is known.
+    val pageDimensions by produceState(
+        initialValue = pdfEngine?.let { it.peekPageDimensions(pageIndex) ?: it.estimatedPageDimensions() }
+            ?: Pair(595, 842),
+        pdfEngine,
+        pageIndex
+    ) {
+        val engine = pdfEngine
+        value = if (engine == null) {
+            Pair(595, 842)
+        } else {
+            engine.peekPageDimensions(pageIndex)
+                ?: kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    engine.getPageDimensions(pageIndex)
+                }
+        }
     }
 
     val aspectRatio = remember(pageDimensions) {
@@ -860,13 +878,7 @@ fun PdfPageItem(
     // Re-render at higher resolution once pinch zoom settles past 1.5x, so
     // enlarged text stays sharp instead of just scaling the base bitmap.
     val targetWidth = remember(screenWidthPx, zoomScale) {
-        val zoomFactor = when {
-            zoomScale >= 2.5f -> 2.5f
-            zoomScale >= 2f -> 2f
-            zoomScale >= 1.5f -> 1.5f
-            else -> 1f
-        }
-        (screenWidthPx * 1.5f * zoomFactor).toInt()
+        PdfEngine.displayTargetWidth(screenWidthPx, zoomScale)
     }
     val initialCached = remember(pdfEngine, pageIndex, targetWidth) {
         pdfEngine?.getCachedBitmap(pageIndex, targetWidth)
@@ -881,6 +893,9 @@ fun PdfPageItem(
 
     val words = remember(pageText) { pageText?.words.orEmpty() }
     val currentBitmap = pageBitmapState.value
+    // Wrapped once per bitmap: a fresh ImageBitmap per recomposition also
+    // recreated the Image's painter and invalidated its drawing.
+    val currentImageBitmap = remember(currentBitmap) { currentBitmap?.asImageBitmap() }
 
     var dragStartWordIndex by remember { mutableStateOf<Int?>(null) }
 
@@ -896,9 +911,9 @@ fun PdfPageItem(
             val pageHPx = constraints.maxHeight.toFloat()
 
             // 1. High-Definition Vector Bitmap Render of PDF
-            if (currentBitmap != null) {
+            if (currentImageBitmap != null) {
                 Image(
-                    bitmap = currentBitmap.asImageBitmap(),
+                    bitmap = currentImageBitmap,
                     contentDescription = "${pageIndex + 1}ページ",
                     contentScale = ContentScale.FillBounds,
                     colorFilter = if (isDarkMode) ColorFilter.colorMatrix(PdfDarkColorMatrix) else null,

@@ -11,10 +11,15 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import android.util.LruCache
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicLongArray
+import kotlin.math.roundToInt
 
 /**
  * Type-safe, structured cache key for rendered PDF page bitmaps.
@@ -266,40 +271,117 @@ class PdfEngine(
             val md = MessageDigest.getInstance("MD5")
             return md.digest(input.toByteArray()).joinToString("") { "%02x".format(it) }
         }
+
+        /** Screen width in px exactly as the viewer computes it (`screenWidthDp.dp.roundToPx()`). */
+        fun screenWidthPx(context: Context): Int {
+            val res = context.resources
+            return (res.configuration.screenWidthDp * res.displayMetrics.density).roundToInt()
+        }
+
+        /**
+         * Bitmap width the viewer requests for a page at [zoomScale]. Shared by
+         * the page composable and the open-time pre-render so both hit the same
+         * cache entry (the pre-render used to use a different width, so the
+         * first page was rendered twice before it appeared).
+         */
+        fun displayTargetWidth(screenWidthPx: Int, zoomScale: Float): Int {
+            val zoomFactor = when {
+                zoomScale >= 2.5f -> 2.5f
+                zoomScale >= 2f -> 2f
+                zoomScale >= 1.5f -> 1.5f
+                else -> 1f
+            }
+            return (screenWidthPx * 1.5f * zoomFactor).toInt()
+        }
+
+        private fun packSize(width: Int, height: Int): Long =
+            (width.toLong() shl 32) or (height.toLong() and 0xFFFFFFFFL)
     }
 
     private var fileDescriptor: ParcelFileDescriptor? = null
+    @Volatile
     private var pdfRenderer: PdfRenderer? = null
+
+    /**
+     * Serializes page renders as a suspending queue: waiting requests no
+     * longer block Dispatchers.Default threads on the engine monitor, and a
+     * request cancelled while queued (its page scrolled away) is dropped
+     * before rendering. The monitor still guards every PdfRenderer access.
+     */
+    private val renderMutex = Mutex()
 
     val file: File = PdfSecurity.prepareForRendering(context, localPdfFile, password)
     val pageCount: Int
+
+    /** Page sizes in points, packed by [packSize]; 0 = not measured yet. */
+    private val pageSizes: AtomicLongArray
 
     init {
         try {
             fileDescriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
             pdfRenderer = PdfRenderer(fileDescriptor!!)
             pageCount = pdfRenderer?.pageCount ?: 0
+            pageSizes = AtomicLongArray(pageCount.coerceAtLeast(0))
             registerEngine(localPdfFile.absolutePath)
         } catch (error: Throwable) {
             fileDescriptor?.close()
             if (file != localPdfFile) file.delete()
             throw error
         }
+        // The first page's size is the placeholder for pages not measured yet.
+        if (pageCount > 0) getPageDimensions(0)
     }
+
+    private fun recordPageSize(pageIndex: Int, width: Int, height: Int) {
+        if (pageIndex in 0 until pageCount && width > 0 && height > 0) {
+            pageSizes.set(pageIndex, packSize(width, height))
+        }
+    }
+
+    /**
+     * Page size if already known, without touching the renderer. Safe to call
+     * from composition: [getPageDimensions] has to wait for the engine monitor,
+     * which a render running on a background thread holds for its whole
+     * duration, so calling it on the main thread stalled scrolling.
+     */
+    fun peekPageDimensions(pageIndex: Int): Pair<Int, Int>? {
+        if (pageIndex < 0 || pageIndex >= pageCount) return null
+        val packed = pageSizes.get(pageIndex)
+        if (packed == 0L) return null
+        return Pair((packed ushr 32).toInt(), packed.toInt())
+    }
+
+    /** Best guess for a page not measured yet: the first page's size (most documents use one size). */
+    fun estimatedPageDimensions(): Pair<Int, Int> = peekPageDimensions(0) ?: Pair(595, 842)
 
     fun getPageDimensions(pageIndex: Int): Pair<Int, Int> {
         val renderer = pdfRenderer ?: return Pair(595, 842)
         if (pageIndex < 0 || pageIndex >= pageCount) return Pair(595, 842)
+        peekPageDimensions(pageIndex)?.let { return it }
 
         return synchronized(this) {
             try {
                 renderer.openPage(pageIndex).use { page ->
+                    recordPageSize(pageIndex, page.width, page.height)
                     Pair(page.width, page.height)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error getting page dimensions: ${e.message}")
                 Pair(595, 842)
             }
+        }
+    }
+
+    /**
+     * Measures every page in the background (each measurement holds the engine
+     * monitor only briefly, so renders interleave), so pages scrolled into
+     * view get their real aspect ratio immediately.
+     */
+    suspend fun preloadPageDimensions() = withContext(Dispatchers.IO) {
+        for (pageIndex in 0 until pageCount) {
+            ensureActive()
+            if (pdfRenderer == null) return@withContext
+            if (pageSizes.get(pageIndex) == 0L) getPageDimensions(pageIndex)
         }
     }
 
@@ -321,9 +403,62 @@ class PdfEngine(
             if (!cached.isRecycled) return@withContext cached
         }
 
-        val renderer = pdfRenderer ?: return@withContext null
+        renderMutex.withLock {
+            // Dropped if the requester went away while queued.
+            ensureActive()
+            // Another request may have rendered this page while we waited.
+            bitmapCache.get(cacheKey)?.let { cached ->
+                if (!cached.isRecycled) return@withLock cached
+            }
+            renderLocked(pageIndex, targetWidth, cacheKey)
+        }
+    }
 
-        synchronized(this@PdfEngine) {
+    /**
+     * Runs [block] with a bitmap of [pageIndex] for OCR. Reuses a cached
+     * render requested at least [minWidth] wide (normally the page the user is
+     * looking at) instead of rendering the page a second time; otherwise
+     * renders one at [minWidth] that is *not* put into the shared LRU cache
+     * (OCR renders used to evict the pages on screen) and is recycled after
+     * [block]. [block] must not keep the bitmap. Null if no bitmap is available.
+     */
+    suspend fun <T> withOcrBitmap(pageIndex: Int, minWidth: Int = 1080, block: suspend (Bitmap) -> T): T? {
+        if (pageIndex < 0 || pageIndex >= pageCount) return null
+        findCachedBitmap(pageIndex, minWidth)?.let { return block(it) }
+        val rendered = withContext(Dispatchers.Default) {
+            renderMutex.withLock {
+                ensureActive()
+                renderLocked(pageIndex, minWidth, cacheKey = null)
+            }
+        } ?: return null
+        return try {
+            block(rendered)
+        } finally {
+            if (!rendered.isRecycled) rendered.recycle()
+        }
+    }
+
+    /** Smallest cached render of [pageIndex] requested at >= [minWidth] px. */
+    private fun findCachedBitmap(pageIndex: Int, minWidth: Int): Bitmap? {
+        val path = localPdfFile.absolutePath
+        var best: Bitmap? = null
+        var bestWidth = Int.MAX_VALUE
+        for ((key, bitmap) in bitmapCache.snapshot()) {
+            if (key.filePath == path && key.pageIndex == pageIndex && key.targetWidth >= minWidth &&
+                key.targetWidth < bestWidth && !bitmap.isRecycled
+            ) {
+                best = bitmap
+                bestWidth = key.targetWidth
+            }
+        }
+        return best
+    }
+
+    /** Renders [pageIndex]; caller holds [renderMutex]. Cached under [cacheKey] unless it is null. */
+    private fun renderLocked(pageIndex: Int, targetWidth: Int, cacheKey: PageCacheKey?): Bitmap? {
+        val renderer = pdfRenderer ?: return null
+
+        return synchronized(this@PdfEngine) {
             // OOM-safe rendering: size is chosen from the requested width without a
             // 1.0 lower bound (small requests may render below the page's point size),
             // capped by a maximum pixel area, and on OutOfMemoryError the cache is
@@ -335,6 +470,7 @@ class PdfEngine(
             for (attempt in 0 until MAX_RENDER_ATTEMPTS) {
                 try {
                     return@synchronized renderer.openPage(pageIndex).use { page ->
+                        recordPageSize(pageIndex, page.width, page.height)
                         val originalWidth = page.width.coerceAtLeast(1)
                         val originalHeight = page.height.coerceAtLeast(1)
 
@@ -358,7 +494,7 @@ class PdfEngine(
                             throw t
                         }
 
-                        bitmapCache.put(cacheKey, bitmap)
+                        if (cacheKey != null) bitmapCache.put(cacheKey, bitmap)
                         bitmap
                     }
                 } catch (e: OutOfMemoryError) {

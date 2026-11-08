@@ -62,23 +62,30 @@ class TranslateController(context: Context) {
         }
     }
 
-    /** Streaming variant: [onPartial] receives the accumulated translation as it grows. */
+    /**
+     * Streaming variant: [onPartial] receives the accumulated translation as it
+     * grows. Pass null when partial results are not needed: the native loop
+     * then skips the per-token JNI upcall and string building entirely.
+     */
     suspend fun translateStream(
         text: String,
         srcLang: String,
         tgtLang: String,
-        onPartial: (String) -> Unit,
+        onPartial: ((String) -> Unit)? = null,
     ): TranslateResult = engineMutex.withLock {
         withContext(Dispatchers.Default) {
             val h = sharedHandle
             if (h == 0L) return@withContext TranslateResult.Error("モデル未読み込み")
             val prompt = PlamoPrompt.build(text, tgtLang, srcLang)
-            val acc = StringBuilder()
-            val result = try {
-                sharedEngine.nativeTranslateStream(h, prompt, 1024) { piece ->
+            val callback = onPartial?.let { consumer ->
+                val acc = StringBuilder()
+                LlamaEngine.TokenCallback { piece ->
                     acc.append(piece)
-                    onPartial(acc.toString())
+                    consumer(acc.toString())
                 }
+            }
+            val result = try {
+                sharedEngine.nativeTranslateStream(h, prompt, 1024, callback)
             } catch (t: Throwable) {
                 null
             }
