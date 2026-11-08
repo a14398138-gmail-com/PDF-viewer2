@@ -91,6 +91,8 @@ fun HomeScreen(
     historyList: List<PdfItem>,
     themeMode: ThemeMode = ThemeMode.SYSTEM,
     onThemeModeChanged: (ThemeMode) -> Unit = {},
+    keepScreenOn: Boolean = false,
+    onKeepScreenOnChanged: (Boolean) -> Unit = {},
     onOpenPdfUri: (Uri) -> Unit,
     onOpenHistoryItem: (PdfItem) -> Unit = {},
     onOpenSamplePdf: () -> Unit,
@@ -262,6 +264,17 @@ fun HomeScreen(
                                     modifier = Modifier.testTag("theme_menu_${mode.name.lowercase()}")
                                 )
                             }
+
+                            androidx.compose.material3.HorizontalDivider(
+                                modifier = Modifier.padding(vertical = 4.dp),
+                                color = MaterialTheme.colorScheme.outlineVariant
+                            )
+                            KeepScreenOnMenuItem(
+                                enabled = keepScreenOn,
+                                onEnabledChange = onKeepScreenOnChanged,
+                                onDismissMenu = { themeMenuExpanded = false },
+                                modifier = Modifier.testTag("home_menu_keep_screen_on")
+                            )
                         }
                     }
 

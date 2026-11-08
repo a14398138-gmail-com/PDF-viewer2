@@ -188,6 +188,8 @@ fun PdfViewerScreen(
     translatingPages: Set<Int> = emptySet(),
     pageTranslationProgress: Map<Int, Pair<Int, Int>> = emptyMap(),
     availableShareApps: List<LastSharedApp> = emptyList(),
+    keepScreenOn: Boolean = false,
+    onKeepScreenOnChanged: (Boolean) -> Unit = {},
     onSaveWithoutPassword: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
@@ -541,7 +543,15 @@ fun PdfViewerScreen(
                                         color = MaterialTheme.colorScheme.outlineVariant
                                     )
 
-                                    // 4. テーマモード切り替え (システム / ライト / ダーク)
+                                    // 4. 画面をオフにしない (アプリ表示中のみ)
+                                    KeepScreenOnMenuItem(
+                                        enabled = keepScreenOn,
+                                        onEnabledChange = onKeepScreenOnChanged,
+                                        onDismissMenu = { menuExpanded = false },
+                                        modifier = Modifier.testTag("menu_item_keep_screen_on")
+                                    )
+
+                                    // 5. テーマモード切り替え (システム / ライト / ダーク)
                                     ThemeMode.values().forEach { mode ->
                                         DropdownMenuItem(
                                             text = {

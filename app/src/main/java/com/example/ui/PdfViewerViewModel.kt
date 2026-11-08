@@ -38,6 +38,8 @@ data class ExtractionProgress(val done: Int, val total: Int)
 /** Minimum spacing between batched publications of background-extracted pages. */
 private const val EXTRACTION_PUBLISH_INTERVAL_MS = 300L
 
+private const val PREF_KEEP_SCREEN_ON = "keep_screen_on"
+
 class PdfViewerViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository: PdfRepository
@@ -51,6 +53,18 @@ class PdfViewerViewModel(application: Application) : AndroidViewModel(applicatio
     fun setThemeMode(mode: ThemeMode) {
         _themeMode.value = mode
         prefs.edit().putString("theme_mode", mode.name).apply()
+    }
+
+    /**
+     * "画面をオフにしない": while on and the app is in the foreground, MainActivity
+     * keeps the screen on until KEEP_SCREEN_ON_IDLE_MS pass without user input.
+     */
+    private val _keepScreenOn = MutableStateFlow(prefs.getBoolean(PREF_KEEP_SCREEN_ON, false))
+    val keepScreenOn: StateFlow<Boolean> = _keepScreenOn.asStateFlow()
+
+    fun setKeepScreenOn(enabled: Boolean) {
+        _keepScreenOn.value = enabled
+        prefs.edit().putBoolean(PREF_KEEP_SCREEN_ON, enabled).apply()
     }
 
     private fun loadSavedThemeMode(): ThemeMode {
