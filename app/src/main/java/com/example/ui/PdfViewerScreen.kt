@@ -23,7 +23,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -89,6 +88,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -135,6 +135,7 @@ import com.example.pdf.SearchMatch
 import com.example.pdf.TextWord
 import com.example.util.LastShareAppManager
 import com.example.util.LastSharedApp
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import java.io.File
@@ -212,16 +213,23 @@ fun PdfViewerScreen(
         }
     }
 
-    // Zoom & Pan State (Pinch-to-zoom / Scale / Pan)
-    var zoomScale by remember { mutableFloatStateOf(1f) }
-    var panOffset by remember { mutableStateOf(Offset.Zero) }
+    // Zoom & Pan State (Pinch-to-zoom / Scale / Pan). The zoom values are
+    // only read in the graphicsLayer block and in gesture code, never during
+    // composition, so pinching does not recompose this screen every frame.
+    val zoomState = remember(listState) { PdfZoomState(listState, coroutineScope) }
+    // The list scrolls by itself only at 1x; zoomed drags are converted by
+    // PdfZoomState so the content follows the finger.
+    val isZoomed by remember(zoomState) { derivedStateOf { zoomState.isZoomed } }
 
     // Settled zoom (debounced) drives high-resolution re-rendering of pages,
     // so pinching does not trigger a render per gesture frame.
     var settledZoomScale by remember { mutableFloatStateOf(1f) }
-    LaunchedEffect(zoomScale) {
-        kotlinx.coroutines.delay(300)
-        settledZoomScale = zoomScale
+    LaunchedEffect(zoomState) {
+        snapshotFlow { zoomState.zoom }
+            .collectLatest { zoom ->
+                kotlinx.coroutines.delay(300)
+                settledZoomScale = zoom
+            }
     }
 
     // Current search hit's highlighted words on its page.
@@ -282,35 +290,22 @@ fun PdfViewerScreen(
             .testTag("pdf_viewer_screen")
     ) {
         // PDF Pages Container with pinch-to-zoom and pan transformations
-        var viewportSize by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .onSizeChanged { viewportSize = it }
-                .pointerInput(Unit) {
-                    detectTransformGestures { _, pan, zoom, _ ->
-                        val newScale = (zoomScale * zoom).coerceIn(1f, 4f)
-                        zoomScale = newScale
-                        if (zoomScale > 1f) {
-                            // Pan limits derive from the actual viewport size
-                            // (content is scaled around the centre), not from
-                            // hardcoded pixel constants.
-                            val maxOffsetX = viewportSize.width * (zoomScale - 1f) / 2f
-                            val maxOffsetY = viewportSize.height * (zoomScale - 1f) / 2f
-                            panOffset = Offset(
-                                x = (panOffset.x + pan.x).coerceIn(-maxOffsetX, maxOffsetX),
-                                y = (panOffset.y + pan.y).coerceIn(-maxOffsetY, maxOffsetY)
-                            )
-                        } else {
-                            panOffset = Offset.Zero
-                        }
-                    }
-                }
+                .onSizeChanged { zoomState.onViewportSizeChanged(it) }
+                .pdfZoomGestures(
+                    state = zoomState,
+                    onGestureStart = { if (!isSliderDragging) onSetControlsVisible(false) }
+                )
                 .graphicsLayer {
-                    scaleX = zoomScale
-                    scaleY = zoomScale
-                    translationX = panOffset.x
-                    translationY = panOffset.y
+                    // Scale about the top-left corner; PdfZoomState keeps the
+                    // pinch focus point and the fingers fixed via the translation.
+                    transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0f)
+                    scaleX = zoomState.zoom
+                    scaleY = zoomState.zoom
+                    translationX = zoomState.pan.x
+                    translationY = zoomState.pan.y
                 }
         ) {
             LazyColumn(
@@ -318,7 +313,8 @@ fun PdfViewerScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .testTag("pdf_page_list"),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+                userScrollEnabled = !isZoomed
             ) {
                 // Top spacer for top app bar clearance
                 item {
@@ -360,13 +356,9 @@ fun PdfViewerScreen(
                             }
                         },
                         onDoubleTap = {
-                            // Double tap to toggle zoom level
-                            if (zoomScale > 1.1f) {
-                                zoomScale = 1f
-                                panOffset = Offset.Zero
-                            } else {
-                                zoomScale = 2.2f
-                            }
+                            // Double tap toggles 2.2x around the tapped point,
+                            // animated instead of jumping.
+                            zoomState.toggleDoubleTapZoom()
                         },
                         modifier = Modifier.fillMaxWidth()
                     )

@@ -285,13 +285,18 @@ class PdfEngine(
          * first page was rendered twice before it appeared).
          */
         fun displayTargetWidth(screenWidthPx: Int, zoomScale: Float): Int {
-            val zoomFactor = when {
-                zoomScale >= 2.5f -> 2.5f
-                zoomScale >= 2f -> 2f
-                zoomScale >= 1.5f -> 1.5f
-                else -> 1f
+            // Each zoom tier renders at the largest zoom shown within it, so the
+            // page stays sharp up to the next tier. (Previously tier x 1.5,
+            // which oversampled the middle tiers by up to 1.5x per axis and
+            // made the re-render after a pinch slower and heavier.) At 1x the
+            // width is unchanged: 1.5x covers zooming up to the first tier.
+            val renderScale = when {
+                zoomScale >= 2.5f -> 3.75f
+                zoomScale >= 2f -> 2.5f
+                zoomScale >= 1.5f -> 2f
+                else -> 1.5f
             }
-            return (screenWidthPx * 1.5f * zoomFactor).toInt()
+            return (screenWidthPx * renderScale).toInt()
         }
 
         private fun packSize(width: Int, height: Int): Long =
