@@ -27,17 +27,89 @@ object PdfTextCache {
      */
     private const val PAGE_SCHEMA_VERSION = 4
 
+    private const val KEY_MEMO_DIR = "keys"
+
+    /** absolutePath -> (size:mtime fingerprint, content key) of files hashed in this process. */
+    private val keyMemo = java.util.concurrent.ConcurrentHashMap<String, Pair<String, String>>()
+
+    private fun fingerprint(file: File): String = "${file.length()}:${file.lastModified()}"
+
+    /**
+     * Content key of [file]: SHA-256 over the whole file, memoized in memory
+     * for as long as the file's size and modification time are unchanged.
+     */
     fun keyFor(file: File): String {
+        val path = file.absolutePath
+        val fp = fingerprint(file)
+        keyMemo[path]?.let { (memoFp, key) -> if (memoFp == fp) return key }
+        val key = hashFile(file)
+        keyMemo[path] = fp to key
+        return key
+    }
+
+    /**
+     * Like [keyFor], but the memo also survives process restarts (a small
+     * sidecar in the cache directory), so reopening a large PDF no longer
+     * re-reads and hashes the whole file every time.
+     */
+    fun keyFor(context: Context, file: File): String {
+        val path = file.absolutePath
+        val fp = fingerprint(file)
+        keyMemo[path]?.let { (memoFp, key) -> if (memoFp == fp) return key }
+
+        val memoFile = File(File(File(context.cacheDir, DIR_NAME), KEY_MEMO_DIR), sha256Hex(path.toByteArray()) + ".key")
+        try {
+            if (memoFile.exists()) {
+                val lines = memoFile.readLines()
+                if (lines.size >= 3 && lines[0] == path && lines[1] == fp && lines[2].length == 64) {
+                    keyMemo[path] = fp to lines[2]
+                    return lines[2]
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Ignoring unreadable key memo for $path: ${e.message}")
+        }
+
+        val key = hashFile(file)
+        keyMemo[path] = fp to key
+        try {
+            memoFile.parentFile?.mkdirs()
+            val tmp = File(memoFile.parentFile, memoFile.name + ".tmp")
+            tmp.writeText("$path\n$fp\n$key\n")
+            if (!tmp.renameTo(memoFile)) {
+                tmp.copyTo(memoFile, overwrite = true)
+                tmp.delete()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to persist key memo for $path: ${e.message}")
+        }
+        return key
+    }
+
+    private fun hashFile(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().use { input ->
-            val buffer = ByteArray(64 * 1024)
+            val buffer = ByteArray(256 * 1024)
             while (true) {
                 val read = input.read(buffer)
                 if (read <= 0) break
                 digest.update(buffer, 0, read)
             }
         }
-        return digest.digest().joinToString("") { "%02x".format(it) }
+        return toHex(digest.digest())
+    }
+
+    private fun sha256Hex(bytes: ByteArray): String =
+        toHex(MessageDigest.getInstance("SHA-256").digest(bytes))
+
+    private fun toHex(bytes: ByteArray): String {
+        val hex = "0123456789abcdef"
+        val sb = StringBuilder(bytes.size * 2)
+        for (b in bytes) {
+            val v = b.toInt() and 0xFF
+            sb.append(hex[v ushr 4]).append(hex[v and 0x0F])
+        }
+        return sb.toString()
     }
 
     private fun pageFile(context: Context, key: String, pageIndex: Int): File {

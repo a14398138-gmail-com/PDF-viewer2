@@ -4,6 +4,9 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -34,7 +37,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.launch
 import com.example.ui.HomeScreen
 import com.example.ui.PdfViewerScreen
@@ -62,6 +67,15 @@ class MainActivity : ComponentActivity() {
 
         handleIntent(intent)
 
+        // Apply "画面をオフにしない" only while the activity is visible.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.keepScreenOn.collect { enabled ->
+                    if (enabled) armKeepScreenOn() else disarmKeepScreenOn()
+                }
+            }
+        }
+
         setContent {
             val themeMode by viewModel.themeMode.collectAsStateWithLifecycle()
             val isDark = when (themeMode) {
@@ -83,6 +97,54 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    // ---- 画面をオフにしない ------------------------------------------------
+    // While the setting is on and the activity is visible, FLAG_KEEP_SCREEN_ON
+    // is set and every user interaction restarts the idle timer. After
+    // KEEP_SCREEN_ON_IDLE_MINUTES without input the flag is cleared, so the
+    // system's normal screen timeout applies again. The flag is always
+    // cleared when the app leaves the foreground.
+    private val keepScreenOnHandler = Handler(Looper.getMainLooper())
+    private var isKeepingScreenOn = false
+    private val releaseKeepScreenOn = Runnable { setKeepScreenOnFlag(false) }
+
+    private fun armKeepScreenOn() {
+        setKeepScreenOnFlag(true)
+        keepScreenOnHandler.removeCallbacks(releaseKeepScreenOn)
+        keepScreenOnHandler.postDelayed(
+            releaseKeepScreenOn,
+            com.example.ui.KEEP_SCREEN_ON_IDLE_MINUTES * 60_000L
+        )
+    }
+
+    private fun disarmKeepScreenOn() {
+        keepScreenOnHandler.removeCallbacks(releaseKeepScreenOn)
+        setKeepScreenOnFlag(false)
+    }
+
+    private fun setKeepScreenOnFlag(on: Boolean) {
+        // Only touch the window when the state changes: addFlags() always
+        // re-sends the window attributes, and this runs on every touch.
+        if (on == isKeepingScreenOn) return
+        isKeepingScreenOn = on
+        if (on) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    override fun onUserInteraction() {
+        super.onUserInteraction()
+        if (viewModel.keepScreenOn.value && lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            armKeepScreenOn()
+        }
+    }
+
+    override fun onStop() {
+        disarmKeepScreenOn()
+        super.onStop()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -170,6 +232,7 @@ fun PdfApp(
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
     val errorMessage by viewModel.errorMessage.collectAsStateWithLifecycle()
     val recentSharedApps by viewModel.recentSharedApps.collectAsStateWithLifecycle()
+    val keepScreenOn by viewModel.keepScreenOn.collectAsStateWithLifecycle()
 
     val passwordRequired by viewModel.passwordRequired.collectAsStateWithLifecycle()
     val passwordError by viewModel.passwordError.collectAsStateWithLifecycle()
@@ -326,6 +389,8 @@ fun PdfApp(
                             isRenameDialogOpen = isRenameDialogOpen,
                             themeMode = themeMode,
                             onThemeModeChanged = onThemeModeChanged,
+                            keepScreenOn = keepScreenOn,
+                            onKeepScreenOnChanged = { viewModel.setKeepScreenOn(it) },
                             onBack = { viewModel.closePdf() },
                             onToggleControls = { viewModel.toggleControls() },
                             onSetControlsVisible = { viewModel.setControlsVisible(it) },
@@ -374,6 +439,8 @@ fun PdfApp(
                         historyList = historyList,
                         themeMode = themeMode,
                         onThemeModeChanged = onThemeModeChanged,
+                        keepScreenOn = keepScreenOn,
+                        onKeepScreenOnChanged = { viewModel.setKeepScreenOn(it) },
                         onOpenPdfUri = { uri -> viewModel.openPdf(uri) },
                         onOpenHistoryItem = { item -> viewModel.openPdfItem(item) },
                         onOpenSamplePdf = { viewModel.openSamplePdf() },

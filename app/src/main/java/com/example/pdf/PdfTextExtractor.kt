@@ -661,7 +661,26 @@ object PdfTextExtractor {
         }
     }
 
+    /** Lowest code point of any block accepted by [isCjkBlock] (CJK Symbols and Punctuation). */
+    private const val CJK_TABLE_START = 0x3000
+
+    /**
+     * [isCjkBlock] memoized for U+3000..U+FFFF. Character.UnicodeBlock.of() is a
+     * binary search over ~300 blocks, and this check runs for every extracted
+     * glyph and for every word pair joined, searched or selected.
+     */
+    private val cjkTable: BooleanArray by lazy {
+        BooleanArray(0x10000 - CJK_TABLE_START) { i -> isCjkBlock((CJK_TABLE_START + i).toChar()) }
+    }
+
     fun isCjkChar(c: Char): Boolean {
+        val code = c.code
+        // No accepted block starts below U+3000: Latin text never needs a lookup.
+        if (code < CJK_TABLE_START) return false
+        return cjkTable[code - CJK_TABLE_START]
+    }
+
+    private fun isCjkBlock(c: Char): Boolean {
         val ub = Character.UnicodeBlock.of(c)
         return ub == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS ||
                 ub == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS_EXTENSION_A ||

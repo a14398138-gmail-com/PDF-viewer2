@@ -15,8 +15,8 @@ android {
     applicationId = "com.aistudio.pdfviewer.vtwk"
     minSdk = 24
     targetSdk = 36
-    versionCode = 12
-    versionName = "1.2.10"
+    versionCode = 13
+    versionName = "1.3.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

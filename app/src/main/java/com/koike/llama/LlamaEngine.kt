@@ -3,7 +3,8 @@ package com.koike.llama
 /** Minimal llama.cpp JNI wrapper shared by the PLaMo translate prototypes. */
 class LlamaEngine {
     external fun nativeLoad(path: String, threads: Int, ctxLen: Int): Long
-    external fun nativeTranslateStream(handle: Long, prompt: String, maxTokens: Int, callback: TokenCallback): String?
+    /** [callback] may be null: the native side then emits no per-token upcalls (see llama_jni.cpp). */
+    external fun nativeTranslateStream(handle: Long, prompt: String, maxTokens: Int, callback: TokenCallback?): String?
 
     fun interface TokenCallback {
         fun onToken(piece: String)

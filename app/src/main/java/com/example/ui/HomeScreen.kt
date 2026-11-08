@@ -91,6 +91,8 @@ fun HomeScreen(
     historyList: List<PdfItem>,
     themeMode: ThemeMode = ThemeMode.SYSTEM,
     onThemeModeChanged: (ThemeMode) -> Unit = {},
+    keepScreenOn: Boolean = false,
+    onKeepScreenOnChanged: (Boolean) -> Unit = {},
     onOpenPdfUri: (Uri) -> Unit,
     onOpenHistoryItem: (PdfItem) -> Unit = {},
     onOpenSamplePdf: () -> Unit,
@@ -262,6 +264,17 @@ fun HomeScreen(
                                     modifier = Modifier.testTag("theme_menu_${mode.name.lowercase()}")
                                 )
                             }
+
+                            androidx.compose.material3.HorizontalDivider(
+                                modifier = Modifier.padding(vertical = 4.dp),
+                                color = MaterialTheme.colorScheme.outlineVariant
+                            )
+                            KeepScreenOnMenuItem(
+                                enabled = keepScreenOn,
+                                onEnabledChange = onKeepScreenOnChanged,
+                                onDismissMenu = { themeMenuExpanded = false },
+                                modifier = Modifier.testTag("home_menu_keep_screen_on")
+                            )
                         }
                     }
 
@@ -386,17 +399,28 @@ fun PdfHistoryCard(
 
     // Decode off the main thread: doing this synchronously in remember{}
     // blocked composition (and scrolling) on file I/O + bitmap decoding.
+    // Decoded thumbnails are kept in memory, so rows scrolled back into view
+    // show their thumbnail immediately instead of decoding the PNG again.
+    val thumbnailPath = item.thumbnailPath
     val thumbnailBitmap by androidx.compose.runtime.produceState<android.graphics.Bitmap?>(
-        initialValue = null,
-        item.thumbnailPath
+        initialValue = thumbnailPath?.let { ThumbnailMemoryCache.get(it) },
+        thumbnailPath
     ) {
-        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            item.thumbnailPath?.let { path ->
-                val file = File(path)
-                if (file.exists()) BitmapFactory.decodeFile(file.absolutePath) else null
-            }
+        value = if (thumbnailPath == null) {
+            null
+        } else {
+            ThumbnailMemoryCache.get(thumbnailPath)
+                ?: kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    val file = File(thumbnailPath)
+                    if (file.exists()) {
+                        BitmapFactory.decodeFile(file.absolutePath)?.also { ThumbnailMemoryCache.put(thumbnailPath, it) }
+                    } else {
+                        null
+                    }
+                }
         }
     }
+    val thumbnailImage = remember(thumbnailBitmap) { thumbnailBitmap?.asImageBitmap() }
 
     Card(
         onClick = onClick,
@@ -424,10 +448,10 @@ fun PdfHistoryCard(
                     .clip(RoundedCornerShape(10.dp))
                     .shadow(1.dp, RoundedCornerShape(10.dp))
             ) {
-                val loadedThumbnail = thumbnailBitmap
+                val loadedThumbnail = thumbnailImage
                 if (loadedThumbnail != null) {
                     Image(
-                        bitmap = loadedThumbnail.asImageBitmap(),
+                        bitmap = loadedThumbnail,
                         contentDescription = "PDFサムネイル",
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
@@ -660,5 +684,18 @@ private fun formatFileSize(bytes: Long): String {
         "%.1f MB".format(mb)
     } else {
         "%.0f KB".format(kb)
+    }
+}
+
+/** Decoded history-list thumbnails (240px-wide PNGs), keyed by file path. */
+private object ThumbnailMemoryCache {
+    private val cache = object : android.util.LruCache<String, android.graphics.Bitmap>(8 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: android.graphics.Bitmap): Int = value.byteCount
+    }
+
+    fun get(path: String): android.graphics.Bitmap? = cache.get(path)?.takeUnless { it.isRecycled }
+
+    fun put(path: String, bitmap: android.graphics.Bitmap) {
+        cache.put(path, bitmap)
     }
 }

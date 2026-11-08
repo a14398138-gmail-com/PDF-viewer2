@@ -17,12 +17,28 @@ object PdfSecurity {
     }
 
     /**
+     * absolutePath -> (size:mtime, result) of probes in this process. Opening a
+     * document probes the same file more than once (viewer engine, thumbnail
+     * engine) and on every reopen; each probe reads the whole file.
+     */
+    private val encryptionProbeMemo = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Boolean>>()
+
+    /**
      * Cheap encryption probe: scans the raw bytes for the "/Encrypt" entry of the
      * trailer dictionary instead of fully parsing the document with PDFBox.
      * Used so the expensive PDFBox load only happens when encryption is suspected.
      */
     fun looksEncrypted(source: File): Boolean {
         if (!source.exists() || source.length() == 0L) return false
+        val path = source.absolutePath
+        val fingerprint = "${source.length()}:${source.lastModified()}"
+        encryptionProbeMemo[path]?.let { (memoFp, result) -> if (memoFp == fingerprint) return result }
+        val result = scanForEncryptMarker(source)
+        encryptionProbeMemo[path] = fingerprint to result
+        return result
+    }
+
+    private fun scanForEncryptMarker(source: File): Boolean {
         val marker = "/Encrypt".toByteArray(Charsets.US_ASCII)
         return try {
             RandomAccessFile(source, "r").use { raf ->
@@ -34,15 +50,21 @@ object PdfSecurity {
                     raf.seek(offset)
                     val read = raf.read(buffer)
                     if (read <= 0) break
-                    // Search the bytes actually read (plus overlap into the marker tail).
-                    val limit = minOf(read, buffer.size - marker.size)
+                    // Every start position of this chunk is checked, reading up to
+                    // marker.size - 1 bytes into the overlap. (The old bound stopped
+                    // marker.size bytes early, so a marker straddling a chunk
+                    // boundary was never found.)
+                    val lastStart = minOf(read - marker.size, chunkSize - 1)
+                    val first = marker[0]
                     var i = 0
-                    while (i <= limit - marker.size) {
-                        var matched = true
-                        for (j in marker.indices) {
-                            if (buffer[i + j] != marker[j]) { matched = false; break }
+                    while (i <= lastStart) {
+                        if (buffer[i] == first) {
+                            var matched = true
+                            for (j in 1 until marker.size) {
+                                if (buffer[i + j] != marker[j]) { matched = false; break }
+                            }
+                            if (matched) return true
                         }
-                        if (matched) return true
                         i++
                     }
                     if (read < buffer.size) break
