@@ -92,6 +92,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -117,6 +118,7 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -125,6 +127,8 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.res.painterResource
 import com.example.R
 import com.example.data.PdfItem
@@ -135,8 +139,10 @@ import com.example.pdf.SearchMatch
 import com.example.pdf.TextWord
 import com.example.util.LastShareAppManager
 import com.example.util.LastSharedApp
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.math.max
 import kotlin.math.min
@@ -210,6 +216,35 @@ fun PdfViewerScreen(
         if (activeSelectedText == null) {
             isShareAppsDrawerVisible = false
         }
+    }
+
+    // Quick share: the app the user last chose as a share target. Its icon is
+    // shown next to the toolbar share button for one-tap file sharing.
+    // Refreshed on every ON_RESUME so a target picked in the chooser shows up
+    // as soon as the user returns to the viewer.
+    var lastShareApp by remember { mutableStateOf<LastSharedApp?>(null) }
+    var chosenShareApps by remember { mutableStateOf<List<LastSharedApp>>(emptyList()) }
+    var isQuickShareBarVisible by remember { mutableStateOf(false) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                coroutineScope.launch {
+                    val apps = withContext(Dispatchers.IO) {
+                        LastShareAppManager.getChosenShareApps(context)
+                    }
+                    chosenShareApps = apps
+                    lastShareApp = apps.firstOrNull()
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // The pull-up bar belongs to the toolbar; hide it with the controls.
+    LaunchedEffect(isControlsVisible) {
+        if (!isControlsVisible) isQuickShareBarVisible = false
     }
 
     // Zoom & Pan State (Pinch-to-zoom / Scale / Pan)
@@ -789,6 +824,72 @@ fun PdfViewerScreen(
                         )
                     }
 
+                    // 2b. 前回の共有先へ直接シェア (tap) / 上に引いて共有先バーを引き出す (swipe up)
+                    val quickShareApp = lastShareApp
+                    if (quickShareApp != null) {
+                        var quickDragOffsetY by remember { mutableFloatStateOf(0f) }
+                        Box(
+                            modifier = Modifier
+                                .size(44.dp)
+                                .pointerInput(Unit) {
+                                    detectVerticalDragGestures(
+                                        onVerticalDrag = { change, dragAmount ->
+                                            change.consume()
+                                            quickDragOffsetY += dragAmount
+                                            if (quickDragOffsetY < -14f) {
+                                                isQuickShareBarVisible = true
+                                            }
+                                        },
+                                        onDragEnd = {
+                                            if (quickDragOffsetY < -10f) {
+                                                isQuickShareBarVisible = true
+                                            }
+                                            quickDragOffsetY = 0f
+                                        },
+                                        onDragCancel = {
+                                            quickDragOffsetY = 0f
+                                        }
+                                    )
+                                }
+                                .testTag("bottom_action_quick_share")
+                        ) {
+                            Surface(
+                                onClick = {
+                                    if (isQuickShareBarVisible) {
+                                        isQuickShareBarVisible = false
+                                    } else if (!sharePdfFileDirect(context, pdfItem, quickShareApp)) {
+                                        sharePdfFile(context, pdfItem)
+                                    }
+                                },
+                                shape = CircleShape,
+                                color = Color.Transparent,
+                                modifier = Modifier.fillMaxSize()
+                            ) {
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier.fillMaxSize()
+                                ) {
+                                    if (quickShareApp.iconBitmap != null) {
+                                        Image(
+                                            bitmap = quickShareApp.iconBitmap.asImageBitmap(),
+                                            contentDescription = "${quickShareApp.appName} で共有 (上にスワイプで全アプリ)",
+                                            modifier = Modifier
+                                                .size(24.dp)
+                                                .clip(CircleShape)
+                                        )
+                                    } else {
+                                        Icon(
+                                            imageVector = Icons.Default.Share,
+                                            contentDescription = "${quickShareApp.appName} で共有 (上にスワイプで全アプリ)",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(24.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // 3. 検索 (Search: Text search within PDF)
                     IconButton(
                         onClick = onOpenSearch,
@@ -804,6 +905,26 @@ fun PdfViewerScreen(
                     }
                 }
             }
+        }
+
+        // Quick-share apps bar: pulled up from the quick-share icon in the
+        // toolbar; floats just above the bottom toolbar. Same bar and
+        // drag-down-to-close behaviour as the text-selection share drawer.
+        if (isQuickShareBarVisible && chosenShareApps.isNotEmpty()) {
+            PdfShareAppsVerticalBar(
+                apps = chosenShareApps,
+                onAppClicked = { app ->
+                    isQuickShareBarVisible = false
+                    if (!sharePdfFileDirect(context, pdfItem, app)) {
+                        sharePdfFile(context, pdfItem)
+                    }
+                },
+                onClose = { isQuickShareBarVisible = false },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(bottom = 90.dp)
+            )
         }
     }
 
@@ -1327,27 +1448,48 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawTranslatedBlock
     }
 }
 
+private fun pdfShareUri(context: Context, item: PdfItem): Uri {
+    val file = item.filePath?.let { File(it) }
+    return if (file != null && file.exists()) {
+        FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            file
+        )
+    } else {
+        Uri.parse(item.uriString)
+    }
+}
+
 private fun sharePdfFile(context: Context, item: PdfItem) {
     try {
-        val file = item.filePath?.let { File(it) }
-        val shareUri: Uri = if (file != null && file.exists()) {
-            FileProvider.getUriForFile(
-                context,
-                "${context.packageName}.fileprovider",
-                file
+        val shareUri = pdfShareUri(context, item)
+        // Use the recording chooser so the app the user picks becomes the
+        // quick-share target shown next to this button.
+        context.startActivity(
+            LastShareAppManager.createFileShareChooserIntent(
+                context = context,
+                uri = shareUri,
+                mimeType = "application/pdf",
+                subject = item.fileName,
+                title = "${item.fileName} を共有"
             )
-        } else {
-            Uri.parse(item.uriString)
-        }
-
-        val shareIntent = Intent(Intent.ACTION_SEND).apply {
-            type = "application/pdf"
-            putExtra(Intent.EXTRA_STREAM, shareUri)
-            putExtra(Intent.EXTRA_SUBJECT, item.fileName)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        context.startActivity(Intent.createChooser(shareIntent, "${item.fileName} を共有"))
+        )
     } catch (e: Exception) {
         Toast.makeText(context, "共有できませんでした: ${e.message}", Toast.LENGTH_SHORT).show()
+    }
+}
+
+private fun sharePdfFileDirect(context: Context, item: PdfItem, target: LastSharedApp): Boolean {
+    return try {
+        LastShareAppManager.directShareFile(
+            context = context,
+            uri = pdfShareUri(context, item),
+            mimeType = "application/pdf",
+            subject = item.fileName,
+            target = target
+        )
+    } catch (e: Exception) {
+        false
     }
 }
