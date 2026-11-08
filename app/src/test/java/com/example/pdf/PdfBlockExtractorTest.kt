@@ -107,6 +107,24 @@ class PdfBlockExtractorTest {
     }
 
     @Test
+    fun sameRowFragmentsOfOneLineStayOneBlock() {
+        // One visual row emitted as two chunks (title split into two
+        // horizontally disjoint fragments at the same relY): they must form
+        // ONE block, otherwise each fragment is translated separately and
+        // painted as its own garbled overlay.
+        val lines = listOf(
+            line(0, "Rapid blue-light", 0.08f, 0.05f, 0.2f, h = 0.03f),
+            line(1, "induction of protein", 0.35f, 0.05f, 0.2f, h = 0.03f),
+            line(2, "interactions in living cells", 0.08f, 0.09f, 0.3f, h = 0.03f)
+        )
+        val blocks = PdfBlockExtractor.blocksFromPageText(page(lines))
+        assertEquals(1, blocks.size)
+        assertTrue(blocks[0].text.contains("Rapid"))
+        assertTrue(blocks[0].text.contains("induction"))
+        assertTrue(blocks[0].text.contains("living cells"))
+    }
+
+    @Test
     fun mergeOverlappingBlocksCombinesHeavilyOverlappingRects() {
         fun block(idx: Int, text: String, x: Float, y: Float, w: Float, h: Float) = TextBlock(
             blockIndex = idx, text = text, relX = x, relY = y,
