@@ -9,6 +9,8 @@ on:
     branches:
       - main
       - master
+    # closed: removes the PR's pre-release build (see cleanup-pr-release).
+    types: [opened, synchronize, reopened, closed]
   workflow_dispatch: # GitHubのActionsタブから手動で実行可能
 
 permissions:
@@ -17,6 +19,7 @@ permissions:
 jobs:
   build:
     name: Build Debug APK
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: ubuntu-latest
 
     steps:
@@ -48,13 +51,18 @@ jobs:
                && [ -s debug.keystore ] \
                && keytool -list -keystore debug.keystore -storepass android >/dev/null 2>&1; then
               echo "Using keystore from DEBUG_KEYSTORE_BASE64."
+              echo "KEYSTORE_SOURCE=secret" >> "$GITHUB_ENV"
             else
               echo "::error::DEBUG_KEYSTORE_BASE64 could not be decoded into a valid keystore (storepass android). Re-create it with: base64 -w0 debug.keystore"
               exit 1
             fi
           elif [ -f "debug.keystore.base64" ]; then
             base64 -d debug.keystore.base64 > debug.keystore
+            echo "KEYSTORE_SOURCE=repository" >> "$GITHUB_ENV"
           else
+            # Only when the secret is unavailable (e.g. pull requests from forks).
+            echo "::warning::DEBUG_KEYSTORE_BASE64 is not available; signing with a throwaway key. The APK cannot update an installed build."
+            echo "KEYSTORE_SOURCE=generated" >> "$GITHUB_ENV"
             keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
           fi
 
@@ -71,6 +79,26 @@ jobs:
           LLAMA_CPP_DIR: ${{ github.workspace }}/llama.cpp
         run: gradle :app:testDebugUnitTest :app:assembleDebug --stacktrace
 
+      - name: Verify APK signature
+        # Confirms the APK is signed with debug.keystore (from
+        # DEBUG_KEYSTORE_BASE64) and records the signer fingerprint.
+        run: |
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          APKSIGNER=$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
+          if [ -z "$APKSIGNER" ]; then
+            echo "apksigner not found; skipping the signature check."
+            exit 0
+          fi
+          "$APKSIGNER" verify --print-certs "$APK" | tee apksigner.txt
+          SIGNER=$(sed -n 's/.*certificate SHA-256 digest: //p' apksigner.txt | head -1)
+          KEY=$(keytool -list -v -keystore debug.keystore -storepass android -alias androiddebugkey 2>/dev/null \
+            | sed -n 's/^[[:space:]]*SHA256: //p' | head -1 | tr -d ':' | tr 'A-F' 'a-f')
+          if [ -n "$KEY" ] && [ "$SIGNER" != "$KEY" ]; then
+            echo "::error::app-debug.apk is not signed with debug.keystore (APK ${SIGNER}, keystore ${KEY})."
+            exit 1
+          fi
+          echo "SIGNER_SHA256=${SIGNER}" >> "$GITHUB_ENV"
+
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -78,6 +106,63 @@ jobs:
           path: app/build/outputs/apk/debug/*.apk
           retention-days: 14
           overwrite: true
+
+      # Pull requests from this repository get a direct-download build as a
+      # pre-release tagged pr-<number> (replaced on every push, deleted when the
+      # PR is closed), so the APK can be installed without unzipping the
+      # Actions artifact. Fork PRs have neither secrets nor a write token.
+      - name: Publish PR APK to a pre-release (direct download)
+        id: pr_release
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          TAG="pr-${PR_NUMBER}"
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          # Recreated each time so the tag always points at the commit that was built.
+          gh release delete "$TAG" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "$TAG" "$APK" \
+            --target "$HEAD_SHA" \
+            --prerelease \
+            --latest=false \
+            --title "PR #${PR_NUMBER} Debug Build" \
+            --notes "PR #${PR_NUMBER} のテストビルド（ビルド #${RUN_NUMBER}、コミット ${HEAD_SHA}）。PRを閉じると自動で削除されます。"
+          echo "apk_url=https://github.com/${GH_REPO}/releases/download/${TAG}/app-debug.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Send PR APK download link to Discord
+        if: steps.pr_release.outcome == 'success'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          APK_URL: ${{ steps.pr_release.outputs.apk_url }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL is not set; skipping."
+            exit 0
+          fi
+          if [ "$KEYSTORE_SOURCE" = "generated" ]; then
+            SIGNING="⚠️ 署名: DEBUG_KEYSTORE_BASE64 が使えず使い捨て鍵で署名（インストール済みアプリに上書きできません）"
+          else
+            SIGNING="🔑 署名: debug.keystore（SHA-256 …${SIGNER_SHA256: -16}）"
+          fi
+          CONTENT=$(printf '📱 %s PR #%s のAPKができました（ビルド #%s / %s）\n%s\n⬇️ APK: %s\n🔗 PR: %s\n%s' \
+            "$REPO_NAME" "$PR_NUMBER" "$RUN_NUMBER" "${HEAD_SHA:0:7}" "$PR_TITLE" "$APK_URL" "$PR_URL" "$SIGNING")
+          PAYLOAD=$(jq -n --arg content "$CONTENT" '{content: $content}')
+          STATUS=$(curl -sS -o /dev/null -w "%{http_code}" -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK_URL")
+          echo "Discord webhook responded: ${STATUS}"
+          if [ "$STATUS" != "200" ] && [ "$STATUS" != "204" ]; then
+            echo "Discord webhook delivery failed (HTTP ${STATUS})."
+            exit 1
+          fi
 
       - name: Publish APK to GitHub Release (Direct Download)
         if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) || github.event_name == 'workflow_dispatch'
@@ -128,3 +213,31 @@ jobs:
             echo "Discord webhook delivery failed (HTTP ${STATUS})."
             exit 1
           fi
+
+      - name: Notify Discord of a failed build
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          TARGET: ${{ github.event_name == 'pull_request' && format('PR #{0}', github.event.pull_request.number) || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            exit 0
+          fi
+          CONTENT=$(printf '⚠️ %s %s のAPKビルドに失敗しました（ビルド #%s）\nログ: %s' "$REPO_NAME" "$TARGET" "$RUN_NUMBER" "$RUN_URL")
+          PAYLOAD=$(jq -n --arg content "$CONTENT" '{content: $content}')
+          curl -sS -o /dev/null -w "Discord webhook responded: %{http_code}\n" -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK_URL" || true
+
+  cleanup-pr-release:
+    name: Remove PR pre-release
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete the pr-<number> pre-release and its tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: pr-${{ github.event.pull_request.number }}
+        run: gh release delete "$TAG" --cleanup-tag --yes || echo "No pre-release ${TAG} to delete."
