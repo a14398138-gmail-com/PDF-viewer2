@@ -68,8 +68,11 @@ object PdfBlockExtractor {
      * v5: image-overlap threshold back to 0.5 — at 0.2 figure captions
      * slightly overlapping a panel image were excluded and stayed
      * untranslated.
+     * v6: same-row line fragments stay in one block (titles and paragraphs
+     * shattered into per-fragment blocks whose translations were painted
+     * separately).
      */
-    const val LAYOUT_SCHEMA_VERSION = 5
+    const val LAYOUT_SCHEMA_VERSION = 6
 
     /** A line counts as figure text when at least this share of it lies
      *  inside a placed image. 0.5: mostly inside the image. Lower values
@@ -476,6 +479,15 @@ object PdfBlockExtractor {
         bodyHeight: Float
     ): Boolean {
         if (FIGURE_CAPTION_START.containsMatchIn(line.text.trim())) return true
+        // Side-by-side pieces of one visual row must stay in one block:
+        // PDFTextStripper emits a row as several chunks and the extractor
+        // segments rows on large gaps, so consecutive entries can be two
+        // horizontally disjoint fragments of the same row. Their horizontal
+        // overlap is zero, so without this rule every fragment became its own
+        // block — titles shattered into word groups and paragraphs split at
+        // each row, and the per-fragment translations (trailing hyphens
+        // included) were painted as separate garbled overlays.
+        if (line.relY < prev.relY + prev.relHeight * 0.5f) return false
         val gap = line.relY - (prev.relY + prev.relHeight)
         // A line whose size differs sharply from the running cluster (or
         // from its immediate neighbour) starts a new block — this is what
