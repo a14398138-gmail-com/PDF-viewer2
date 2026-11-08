@@ -10,6 +10,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
+import android.net.Uri
 import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
@@ -278,6 +279,135 @@ object LastShareAppManager {
             true
         } catch (e: Exception) {
             Log.w("LastShareAppManager", "Direct share failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * The app the user most recently *chose* as a share target (text or file),
+     * or null when nothing has been chosen yet. Unlike [getRecentSharedApps],
+     * this never falls back to system-suggested apps, so it is safe to present
+     * as "the app you shared to last time".
+     */
+    fun getLastChosenShareApp(context: Context): LastSharedApp? =
+        getChosenShareApps(context).firstOrNull()
+
+    /**
+     * All apps the user has previously *chosen* as share targets, most recent
+     * first, with uninstalled apps dropped. Unlike [getRecentSharedApps] this
+     * never adds system-suggested apps the user has not actually used.
+     */
+    fun getChosenShareApps(context: Context): List<LastSharedApp> {
+        val pm = context.packageManager
+        val candidates = mutableListOf<Pair<String, String?>>()
+        for (item in getHistoryEntries(context)) {
+            val pkg = item.optString("pkg")
+            if (pkg.isNotBlank()) {
+                candidates.add(pkg to item.optString("cls").takeIf { it.isNotBlank() })
+            }
+        }
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.getString(KEY_PACKAGE, null)?.let { pkg ->
+            if (candidates.none { it.first == pkg }) {
+                candidates.add(pkg to prefs.getString(KEY_CLASS, null))
+            }
+        }
+        val result = mutableListOf<LastSharedApp>()
+        for ((pkg, cls) in candidates) {
+            try {
+                val appInfo = pm.getApplicationInfo(pkg, 0)
+                val iconDrawable = if (cls != null) {
+                    try {
+                        pm.getActivityIcon(ComponentName(pkg, cls))
+                    } catch (e: Exception) {
+                        pm.getApplicationIcon(pkg)
+                    }
+                } else {
+                    pm.getApplicationIcon(pkg)
+                }
+                result.add(
+                    LastSharedApp(
+                        packageName = pkg,
+                        className = cls,
+                        appName = pm.getApplicationLabel(appInfo).toString(),
+                        iconBitmap = drawableToBitmap(iconDrawable)
+                    )
+                )
+            } catch (e: Exception) {
+                // Uninstalled since it was recorded; skip it.
+            }
+        }
+        return result
+    }
+
+    fun createFileShareChooserIntent(
+        context: Context,
+        uri: Uri,
+        mimeType: String,
+        subject: String?,
+        title: String
+    ): Intent {
+        val sendIntent = Intent(Intent.ACTION_SEND).apply {
+            type = mimeType
+            putExtra(Intent.EXTRA_STREAM, uri)
+            if (!subject.isNullOrBlank()) putExtra(Intent.EXTRA_SUBJECT, subject)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+
+        val receiverIntent = Intent(context, ShareTargetReceiver::class.java).apply {
+            action = ACTION_SHARE_CHOSEN
+        }
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val pendingIntent = PendingIntent.getBroadcast(
+            context,
+            1002,
+            receiverIntent,
+            flags
+        )
+
+        return Intent.createChooser(sendIntent, title, pendingIntent.intentSender)
+    }
+
+    fun directShareFile(
+        context: Context,
+        uri: Uri,
+        mimeType: String,
+        subject: String?,
+        target: LastSharedApp
+    ): Boolean {
+        return try {
+            try {
+                context.grantUriPermission(
+                    target.packageName,
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (e: Exception) {
+                // The grant flag on the intent may still be enough; keep going.
+            }
+            val directIntent = Intent(Intent.ACTION_SEND).apply {
+                type = mimeType
+                putExtra(Intent.EXTRA_STREAM, uri)
+                if (!subject.isNullOrBlank()) putExtra(Intent.EXTRA_SUBJECT, subject)
+                if (!target.className.isNullOrBlank()) {
+                    component = ComponentName(target.packageName, target.className)
+                } else {
+                    setPackage(target.packageName)
+                }
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(directIntent)
+            if (!target.className.isNullOrBlank()) {
+                saveLastSharedApp(context, ComponentName(target.packageName, target.className))
+            }
+            true
+        } catch (e: Exception) {
+            Log.w("LastShareAppManager", "Direct file share failed: ${e.message}")
             false
         }
     }
